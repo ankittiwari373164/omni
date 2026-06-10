@@ -1,0 +1,39 @@
+name: Video Worker
+
+on:
+  schedule:
+    - cron: "0 */2 * * *"   # every 2 hours (UTC). Note: GitHub may delay scheduled runs.
+  workflow_dispatch:         # manual "Run workflow" button for instant processing
+
+concurrency:
+  group: video-worker        # never two workers at once (Flow session conflicts)
+  cancel-in-progress: false
+
+jobs:
+  worker:
+    runs-on: ubuntu-latest   # ffmpeg is preinstalled on this runner
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Install Chromium for Playwright
+        run: npx playwright install --with-deps chromium
+
+      - name: Run worker (queue + RSS)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GROQ_MODEL: llama-3.3-70b-versatile
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REDIRECT_URI: ${{ secrets.GOOGLE_REDIRECT_URI }}
+          WORKER_MAX_VIDEOS: "4"
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x800x24" node worker.js

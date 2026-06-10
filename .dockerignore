@@ -1,0 +1,10 @@
+node_modules
+.git
+.github
+.env
+uploads/*
+outputs/*
+assets/*
+!uploads/.gitkeep
+!outputs/.gitkeep
+!assets/.gitkeep

@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Flow Studio · Multi-Client</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+  :root{
+    --bg:#0a0a0f; --surface:#111118; --surface2:#15151f; --border:#1e1e2e; --border2:#2a2a3e;
+    --text:#e8e8f0; --muted:#6b6b80; --accent:#6c63ff; --accent2:#a78bfa;
+    --green:#34d399; --red:#f87171; --orange:#fb923c; --gold:#f0b429; --radius:12px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Inter',sans-serif}
+  .app{display:grid;grid-template-columns:260px 1fr;height:100vh}
+
+  /* Sidebar */
+  .sidebar{background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
+  .brand{padding:18px 20px;display:flex;align-items:center;gap:10px;font-weight:700;letter-spacing:-.3px;border-bottom:1px solid var(--border)}
+  .brand svg{width:26px;height:26px}
+  .sb-head{padding:14px 20px 8px;font-size:10px;font-weight:600;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted);display:flex;justify-content:space-between;align-items:center}
+  .sb-add{cursor:pointer;color:var(--accent2);font-size:18px;line-height:1;background:none;border:none}
+  .client-list{flex:1;overflow-y:auto;padding:0 10px}
+  .client-item{padding:11px 12px;border-radius:10px;cursor:pointer;font-size:14px;font-weight:500;display:flex;align-items:center;gap:9px;margin-bottom:2px;color:var(--text);transition:background .15s}
+  .client-item:hover{background:var(--surface2)}
+  .client-item.active{background:rgba(108,99,255,.14);color:var(--accent2)}
+  .client-avatar{width:24px;height:24px;border-radius:7px;background:linear-gradient(135deg,var(--accent),var(--accent2));display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#fff;flex-shrink:0}
+  .sb-empty{padding:20px;color:var(--muted);font-size:12px;text-align:center}
+
+  /* Main */
+  .main{display:flex;flex-direction:column;overflow:hidden}
+  .topbar{height:56px;border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 24px;gap:14px;background:var(--surface)}
+  .topbar h2{font-size:16px;font-weight:600}
+  .tabs{display:flex;gap:4px;margin-left:auto}
+  .tab{padding:7px 14px;border-radius:8px;font-size:13px;font-weight:500;cursor:pointer;color:var(--muted);background:none;border:none}
+  .tab.active{background:var(--surface2);color:var(--text)}
+  .content{flex:1;overflow-y:auto;padding:24px;max-width:1100px;width:100%}
+  .no-client{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:var(--muted);gap:12px}
+
+  .section-label{font-size:10px;font-weight:600;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted);margin-bottom:12px}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:18px}
+  .field{margin-bottom:16px}
+  .field label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px;font-weight:500}
+  input[type=text],textarea,select{width:100%;background:var(--bg);border:1.5px solid var(--border2);border-radius:10px;padding:10px 12px;color:var(--text);font-size:13px;font-family:inherit;outline:none}
+  textarea{resize:vertical;min-height:80px;line-height:1.5}
+  input:focus,textarea:focus,select:focus{border-color:var(--accent)}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .upload-zone{border:1.5px dashed var(--border2);border-radius:10px;padding:16px;text-align:center;cursor:pointer;position:relative;transition:.2s;font-size:12px;color:var(--muted)}
+  .upload-zone:hover{border-color:var(--accent);background:rgba(108,99,255,.05)}
+  .upload-zone input{position:absolute;inset:0;opacity:0;cursor:pointer}
+  .upload-name{color:var(--green);font-family:'JetBrains Mono',monospace;margin-top:4px;font-size:11px}
+  .toggle{display:flex;align-items:center;gap:10px;font-size:13px;margin-bottom:12px;cursor:pointer}
+  .toggle input{width:16px;height:16px;accent-color:var(--accent)}
+  .btn{padding:10px 18px;border:none;border-radius:10px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;background:var(--surface2);color:var(--text);border:1px solid var(--border2)}
+  .btn:hover{border-color:var(--accent)}
+  .btn-primary{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;border:none}
+  .btn-primary:hover{opacity:.92}
+  .btn-sm{padding:6px 12px;font-size:12px}
+  .btn:disabled{opacity:.5;cursor:not-allowed}
+  .btn-row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  .pill{font-size:10px;padding:3px 8px;border-radius:20px;border:1px solid var(--border2);color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+  .pill.green{color:var(--green);border-color:var(--green)}
+  .pill.gold{color:var(--gold);border-color:var(--gold)}
+  .pill.accent{color:var(--accent2);border-color:var(--accent)}
+  .pill.red{color:var(--red);border-color:var(--red)}
+
+  /* calendar */
+  .cal-item{display:flex;gap:14px;align-items:flex-start;padding:14px;border:1px solid var(--border);border-radius:10px;margin-bottom:10px;background:var(--surface)}
+  .cal-date{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--accent2);min-width:78px}
+  .cal-body{flex:1}
+  .cal-topic{font-weight:600;font-size:14px;margin-bottom:3px}
+  .cal-hook{font-size:12px;color:var(--muted);margin-bottom:8px}
+  .cal-prompt{font-size:12px;color:#9090b0;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;margin:8px 0;line-height:1.5;white-space:pre-wrap}
+
+  /* videos grid */
+  .vid-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:16px}
+  .vid-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden}
+  .vid-card video{width:100%;display:block;background:#000;aspect-ratio:9/16;object-fit:contain}
+  .vid-meta{padding:12px}
+  .vid-title{font-size:13px;font-weight:600;margin-bottom:6px;line-height:1.3}
+  .vid-links{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+  .vid-links a{font-size:11px;color:var(--accent2);text-decoration:none}
+
+  /* generate / logs */
+  .gen-grid{display:grid;grid-template-columns:1fr 360px;gap:18px}
+  .log-body{background:#050508;border:1px solid var(--border);border-radius:10px;padding:12px;height:340px;overflow-y:auto;font-family:'JetBrains Mono',monospace;font-size:11.5px;line-height:1.7}
+  .log-line{display:flex;gap:8px}
+  .log-ts{color:#3a3a50;font-size:10px;padding-top:2px;flex-shrink:0}
+  .log-msg{flex:1;word-break:break-word}
+  .log-line.success .log-msg{color:var(--green)} .log-line.error .log-msg{color:var(--red)}
+  .log-line.warn .log-msg{color:var(--orange)} .log-line.progress .log-msg{color:var(--accent2)}
+  .log-line.info .log-msg{color:#9090b0}
+  .preview-video{width:100%;border-radius:10px;background:#000;max-height:520px;display:none}
+
+  ::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
+  .hidden{display:none!important}
+  .hint{font-size:11px;color:var(--muted);margin-top:4px}
+  .toast{position:fixed;bottom:20px;right:20px;background:var(--surface2);border:1px solid var(--border2);padding:12px 16px;border-radius:10px;font-size:13px;z-index:50;opacity:0;transition:.3s;transform:translateY(10px)}
+  .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:100}
+  .modal-overlay.show{display:flex}
+  .modal{background:var(--surface);border:1px solid var(--border2);border-radius:14px;padding:22px;width:560px;max-width:92vw;max-height:88vh;overflow-y:auto}
+  .modal-title{font-size:15px;font-weight:700;margin-bottom:16px}
+  .modal-footer{display:flex;gap:10px;justify-content:flex-end;margin-top:18px}
+  .yt-conn{display:flex;align-items:center;gap:12px;padding:12px;border:1px solid var(--border);border-radius:10px;margin-bottom:14px}
+  .yt-conn .ic{width:34px;height:34px;border-radius:9px;background:rgba(255,0,0,.15);color:#ff5252;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0}
+  .toast.show{opacity:1;transform:none}
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="brand">
+      <svg viewBox="0 0 28 28" fill="none"><rect width="28" height="28" rx="8" fill="#6c63ff" fill-opacity="0.15"/><path d="M7 14 L11 8 L17 16 L20 12 L21 14" stroke="#a78bfa" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><circle cx="21" cy="14" r="2" fill="#6c63ff"/></svg>
+      Flow Studio
+    </div>
+    <div class="sb-head"><span>Clients</span><button class="sb-add" onclick="addClient()" title="Add client">+</button></div>
+    <div class="client-list" id="clientList"><div class="sb-empty">No clients yet.<br>Click + to add one.</div></div>
+  </aside>
+
+  <!-- Main -->
+  <main class="main">
+    <div class="topbar">
+      <h2 id="clientTitle">Flow Studio</h2>
+      <div class="tabs" id="tabs" style="display:none">
+        <button class="tab active" data-tab="config" onclick="switchTab('config')">Config</button>
+        <button class="tab" data-tab="calendar" onclick="switchTab('calendar')">Calendar</button>
+        <button class="tab" data-tab="generate" onclick="switchTab('generate')">Generate</button>
+        <button class="tab" data-tab="videos" onclick="switchTab('videos')">Videos</button>
+      </div>
+    </div>
+    <div class="content" id="content">
+      <div class="no-client">
+        <div style="font-size:40px">🎬</div>
+        <div>Select a client from the sidebar, or add a new one.</div>
+      </div>
+    </div>
+  </main>
+</div>
+<div class="toast" id="toast"></div>
+
+<!-- YouTube settings modal -->
+<div class="modal-overlay" id="ytModal" onclick="closeIfOutside(event,'ytModal')">
+  <div class="modal">
+    <div class="modal-title">▶ YouTube — <span id="ytClientName" style="color:#ff5252"></span></div>
+
+    <div class="yt-conn">
+      <div class="ic">▶</div>
+      <div style="flex:1">
+        <div style="font-size:13px;font-weight:600">Channel connection</div>
+        <div id="ytConnValue" class="hint">Not connected</div>
+      </div>
+      <button class="btn btn-sm" id="ytDisconnectBtn" style="color:var(--red);display:none" onclick="disconnectYoutube()">Disconnect</button>
+    </div>
+    <button class="btn btn-primary" style="width:100%;justify-content:center" onclick="connectYoutube()">Connect YouTube channel (Google sign-in)</button>
+    <div class="hint" style="margin-top:6px">Uploads use the official YouTube Data API. On publish we set <b>Public</b> · <b>Not made for kids</b>. Drive uses the same connection.</div>
+
+    <div style="height:1px;background:var(--border);margin:18px 0"></div>
+
+    <label class="toggle"><input type="checkbox" id="ytEnabled"> Auto-upload every finished video to YouTube</label>
+    <div class="hint" style="margin:2px 0 14px">Title, description, hashtags &amp; tags are generated by Groq from the script, then your templates below are applied.</div>
+
+    <div class="field"><label>Default hashtags (comma separated, optional)</label>
+      <input type="text" id="ytHashtags" placeholder="news, shorts, ai"></div>
+    <div class="field"><label>Default tags (comma separated, optional)</label>
+      <input type="text" id="ytTags" placeholder="breaking news, world news, daily update"></div>
+    <div class="field"><label>Title template (optional · use {title}, {client}, {topic})</label>
+      <input type="text" id="ytTitleTpl" placeholder="{title} | {client}"></div>
+    <div class="field"><label>Description template (optional · use {description}, {client})</label>
+      <textarea id="ytDescTpl" placeholder="{description}&#10;&#10;Follow {client} for daily videos!"></textarea></div>
+
+    <div class="modal-footer">
+      <button class="btn" onclick="closeModal('ytModal')">Close</button>
+      <button class="btn btn-primary" id="ytSaveBtn" onclick="saveYoutubeConfig()">Save settings</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let clients = [];
+let currentClient = null;
+let currentTab = "config";
+let ws = null;
+
+const $ = (id) => document.getElementById(id);
+const esc = (s="") => String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+function toast(msg){const t=$("toast");t.textContent=msg;t.classList.add("show");setTimeout(()=>t.classList.remove("show"),2600);}
+
+async function api(url, opts){ const r = await fetch(url, opts); const j = await r.json().catch(()=>({})); if(!r.ok) throw new Error(j.error||r.statusText); return j; }
+
+// ---------- clients ----------
+async function loadClients(){
+  const list = $("clientList");
+  try{
+    clients = await api("/api/clients");
+  }catch(e){
+    list.innerHTML = `<div class="sb-empty" style="color:var(--red)">Could not load clients:<br>${esc(e.message)}<br><br>Check the server console & your Supabase setup.</div>`;
+    return;
+  }
+  if(!clients.length){ list.innerHTML = '<div class="sb-empty">No clients yet.<br>Click + to add one.</div>'; return; }
+  list.innerHTML = clients.map(c => `
+    <div class="client-item ${currentClient&&currentClient.id===c.id?'active':''}" onclick="selectClient('${c.id}')">
+      <div class="client-avatar">${esc((c.name||'?').slice(0,2).toUpperCase())}</div>
+      <span>${esc(c.name)}</span>
+    </div>`).join("");
+}
+
+async function addClient(){
+  const name = prompt("Client name:");
+  if(!name) return;
+  try{
+    const c = await api("/api/clients", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name})});
+    await loadClients();
+    selectClient(c.id);
+    toast("Client added \u2713");
+  }catch(e){
+    toast("Could not add client: "+e.message);
+    alert("Could not add client.\n\n"+e.message+"\n\nThis usually means Supabase isn't configured yet:\n1. Fill SUPABASE_URL and SUPABASE_SERVICE_KEY in .env\n2. Run supabase-schema.sql in the Supabase SQL editor\n3. Restart the server (npm start)");
+  }
+}
+
+async function selectClient(id){
+  currentClient = await api("/api/clients/"+id);
+  $("clientTitle").textContent = currentClient.name;
+  $("tabs").style.display = "flex";
+  await loadClients();
+  switchTab(currentTab);
+}
+
+function switchTab(tab){
+  currentTab = tab;
+  document.querySelectorAll(".tab").forEach(t=>t.classList.toggle("active",t.dataset.tab===tab));
+  if(tab==="config") renderConfig();
+  else if(tab==="calendar") renderCalendar();
+  else if(tab==="generate") renderGenerate();
+  else if(tab==="videos") renderVideos();
+}
+
+// ---------- CONFIG ----------
+function renderConfig(){
+  const c = currentClient;
+  $("content").innerHTML = `
+    <div class="card">
+      <div class="section-label">Business details</div>
+      <div class="field"><label>Client name</label><input type="text" id="cfgName" value="${esc(c.name)}"></div>
+      <div class="field"><label>Business brief (used by Groq for prompts & calendar)</label>
+        <textarea id="cfgBrief" placeholder="What the brand sells, tone, audience, key products…">${esc(c.business_details||"")}</textarea></div>
+    </div>
+
+    <div class="card">
+      <div class="section-label">Content mode</div>
+      <div class="field"><label>How this client gets video ideas</label>
+        <select id="cfgMode" onchange="toggleRss()">
+          <option value="calendar" ${c.mode!=='rss'?'selected':''}>Content calendar (Groq-generated)</option>
+          <option value="rss" ${c.mode==='rss'?'selected':''}>RSS news feeds (auto, daily)</option>
+        </select></div>
+      <div id="rssCfg" class="${c.mode==='rss'?'':'hidden'}">
+        <div class="field"><label>News categories</label>
+          <div id="catBox" class="hint">Loading categories…</div></div>
+        <div class="field"><label>Extra custom feed URLs (optional, one per line)</label>
+          <textarea id="cfgFeeds" placeholder="https://example.com/custom-feed.xml">${esc(c.rss_feeds||"")}</textarea>
+          <div class="hint">New articles from the selected categories are fetched daily and turned into videos automatically.</div></div>
+        <div class="field" style="max-width:220px"><label>Max auto videos per day</label>
+          <input type="number" id="cfgRssLimit" min="1" max="10" value="${c.rss_daily_limit||3}"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-label">Prompt style</div>
+      <div class="field"><label>How prompts are written for this client</label>
+        <select id="cfgStyle"><option value="${esc(c.prompt_style||'default')}">${esc(c.prompt_style||'default')}</option></select>
+        <div class="hint" id="styleHint"></div></div>
+      <div class="field"><label>Custom prompt template (optional — overrides the style above)</label>
+        <textarea id="cfgPromptCustom" placeholder="Leave blank to use the selected style. Describe the exact prompt structure you want Groq to follow.">${esc(c.prompt_custom||"")}</textarea></div>
+    </div>
+
+    <div class="card">
+      <div class="section-label">Google Flow cookies</div>
+      <div class="field">
+        <div class="upload-zone"><input type="file" id="cookieFile" accept=".json"><div>🍪 Drop cookies.json (export via Cookie-Editor)</div>
+          <div class="upload-name" id="cookieName">${c.cookies?'✓ cookies stored':''}</div></div>
+        <div class="hint">Re-upload whenever cookies expire.</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-label">Branding overlay</div>
+      <div class="row">
+        <div class="field"><label>Frame (PNG, black center keyed out)</label>
+          <div class="upload-zone"><input type="file" id="frameFile" accept="image/png,image/*"><div>🖼️ Frame overlay</div>
+            <div class="upload-name" id="frameName">${c.frame_path?'✓ '+esc(c.frame_path):''}</div></div></div>
+        <div class="field"><label>Outro clip (mp4, appended at end)</label>
+          <div class="upload-zone"><input type="file" id="outroFile" accept="video/*"><div>🎞️ Outro video</div>
+            <div class="upload-name" id="outroName">${c.outro_path?'✓ '+esc(c.outro_path):''}</div></div></div>
+      </div>
+      <div class="field"><label>Fixed reference image (auto-used for every generation)</label>
+        <div class="upload-zone"><input type="file" id="refFile" accept="image/*"><div>🧷 Reference image</div>
+          <div class="upload-name" id="refName">${c.reference_image_path?'✓ '+esc(c.reference_image_path):''}</div></div>
+        <div class="hint">When set, this image is sent with every prompt — no need to upload it each time. (A per-generation upload still overrides it.)</div>
+        ${c.reference_image_path?`<img src="/assets/${esc(c.reference_image_path)}" style="max-height:120px;border-radius:8px;margin-top:8px;border:1px solid var(--border2)">`:''}
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-label">Delivery</div>
+      <label class="toggle"><input type="checkbox" id="cfgDrive" ${c.upload_to_drive?'checked':''}> Upload finished video to Google Drive</label>
+      <div class="field"><label>Drive folder ID or link (optional)</label><input type="text" id="cfgFolder" value="${esc(c.drive_folder_id||"")}" placeholder="leave blank for My Drive root"></div>
+      <div class="btn-row" style="margin-top:6px;align-items:center">
+        <span class="pill ${c.upload_to_youtube?'accent':''}">YouTube ${c.upload_to_youtube?'on':'off'}</span>
+        <span class="pill ${c.youtube_tokens?'green':'red'}">${c.youtube_tokens?('Connected'+(c.youtube_channel?': '+esc(c.youtube_channel):'')):'Not connected'}</span>
+        <button class="btn btn-sm" onclick="openYoutubeModal()">▶ Configure YouTube</button>
+      </div>
+      <div class="hint">Drive uses the same Google connection. Connect it from the YouTube panel.</div>
+    </div>
+
+    <div class="btn-row">
+      <button class="btn btn-primary" id="saveCfg" onclick="saveConfig()">Save config</button>
+      <button class="btn" onclick="deleteClient()" style="color:var(--red)">Delete client</button>
+    </div>`;
+
+  bindName("cookieFile","cookieName"); bindName("frameFile","frameName");
+  bindName("outroFile","outroName"); bindName("refFile","refName");
+  loadStyles(c.prompt_style||"default");
+  loadCategories((c.rss_categories||"").split(",").map(s=>s.trim()).filter(Boolean));
+}
+let STYLES=[];
+async function loadStyles(selected){
+  try{
+    STYLES = await api("/api/styles");
+    const sel=$("cfgStyle"); if(!sel) return;
+    sel.innerHTML = STYLES.map(s=>`<option value="${esc(s.id)}" ${s.id===selected?'selected':''}>${esc(s.label)}</option>`).join("");
+    sel.onchange = styleHint; styleHint();
+  }catch{}
+}
+function styleHint(){
+  const sel=$("cfgStyle"); const h=$("styleHint"); if(!sel||!h) return;
+  const s=STYLES.find(x=>x.id===sel.value);
+  h.innerHTML = "The Flow/Veo model speaks the lines in the prompt — no separate voiceover is added.";
+}
+async function loadCategories(selected){
+  const box=$("catBox"); if(!box) return;
+  try{
+    const cats = await api("/api/feed-categories");
+    box.innerHTML = cats.map(c=>`<label class="toggle" style="display:inline-flex;margin-right:14px">
+      <input type="checkbox" class="catChk" value="${esc(c.id)}" ${selected.includes(c.id)?'checked':''}> ${esc(c.label)} <span style="color:var(--muted)">(${c.count})</span></label>`).join("");
+  }catch{ box.textContent="Could not load categories."; }
+}
+function bindName(inputId,nameId){ const i=$(inputId); if(i) i.addEventListener("change",()=>{ if(i.files[0]) $(nameId).textContent=i.files[0].name; }); }
+function toggleRss(){ $("rssCfg").classList.toggle("hidden", $("cfgMode").value!=="rss"); }
+
+function connectGoogle(){ window.open("/api/oauth/google/start?client_id="+currentClient.id, "_blank", "width=520,height=640");
+  toast("Complete Google sign-in in the popup, then reopen this client."); }
+
+// ---------- YouTube modal ----------
+function closeModal(id){ $(id).classList.remove("show"); }
+function closeIfOutside(e,id){ if(e.target.id===id) closeModal(id); }
+function openYoutubeModal(){
+  const c = currentClient;
+  $("ytClientName").textContent = c.name;
+  $("ytEnabled").checked = !!c.upload_to_youtube;
+  $("ytHashtags").value = c.yt_hashtags || "";
+  $("ytTags").value = c.yt_tags || c.yt_default_tags || "";
+  $("ytTitleTpl").value = c.yt_title_tpl || "";
+  $("ytDescTpl").value = c.yt_desc_tpl || "";
+  const connected = !!c.youtube_tokens;
+  $("ytConnValue").innerHTML = connected
+    ? '<span style="color:var(--green)">Connected'+(c.youtube_channel?': '+esc(c.youtube_channel):'')+'</span>'
+    : 'Not connected';
+  $("ytDisconnectBtn").style.display = connected ? "inline-flex" : "none";
+  $("ytModal").classList.add("show");
+}
+function connectYoutube(){
+  window.open("/api/oauth/google/start?client_id="+currentClient.id, "_blank", "width=520,height=640");
+  toast("Finish Google sign-in, then reopen this panel to see the channel.");
+}
+async function disconnectYoutube(){
+  if(!confirm("Disconnect this YouTube/Drive Google account?")) return;
+  try{
+    await api("/api/clients/"+currentClient.id+"/youtube/disconnect",{method:"POST"});
+    currentClient = await api("/api/clients/"+currentClient.id);
+    openYoutubeModal(); toast("Disconnected");
+  }catch(e){ toast("Error: "+e.message); }
+}
+async function saveYoutubeConfig(){
+  const btn=$("ytSaveBtn"); btn.disabled=true; btn.textContent="Saving…";
+  try{
+    const body = {
+      upload_to_youtube: $("ytEnabled").checked,
+      yt_hashtags: $("ytHashtags").value,
+      yt_tags: $("ytTags").value,
+      yt_title_tpl: $("ytTitleTpl").value,
+      yt_desc_tpl: $("ytDescTpl").value
+    };
+    currentClient = await api("/api/clients/"+currentClient.id+"/youtube",
+      {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    toast("YouTube settings saved ✓"); closeModal("ytModal");
+    if(currentTab==="config") renderConfig();
+  }catch(e){ toast("Error: "+e.message); }
+  btn.disabled=false; btn.textContent="Save settings";
+}
+
+async function saveConfig(){
+  const btn=$("saveCfg"); btn.disabled=true; btn.textContent="Saving…";
+  try{
+    const fd = new FormData();
+    fd.append("name", $("cfgName").value);
+    fd.append("business_details", $("cfgBrief").value);
+    fd.append("upload_to_drive", $("cfgDrive").checked);
+    fd.append("drive_folder_id", $("cfgFolder").value);
+    fd.append("mode", $("cfgMode").value);
+    fd.append("rss_feeds", $("cfgFeeds")?$("cfgFeeds").value:"");
+    if($("cfgRssLimit")) fd.append("rss_daily_limit", $("cfgRssLimit").value);
+    // prompt style
+    if($("cfgStyle")) fd.append("prompt_style", $("cfgStyle").value);
+    if($("cfgPromptCustom")) fd.append("prompt_custom", $("cfgPromptCustom").value);
+    const cats=[...document.querySelectorAll(".catChk:checked")].map(c=>c.value).join(",");
+    fd.append("rss_categories", cats);
+    if($("frameFile").files[0]) fd.append("frame", $("frameFile").files[0]);
+    if($("outroFile").files[0]) fd.append("outro", $("outroFile").files[0]);
+    if($("refFile").files[0]) fd.append("reference_image", $("refFile").files[0]);
+    const cf = $("cookieFile").files[0];
+    if(cf){ fd.append("cookies", await cf.text()); }
+    currentClient = await api("/api/clients/"+currentClient.id+"/config",{method:"POST",body:fd});
+    await loadClients(); $("clientTitle").textContent=currentClient.name;
+    toast("Saved ✓"); renderConfig();
+  }catch(e){ toast("Error: "+e.message); }
+  btn.disabled=false; btn.textContent="Save config";
+}
+async function deleteClient(){
+  if(!confirm("Delete "+currentClient.name+" and all its videos?")) return;
+  await api("/api/clients/"+currentClient.id,{method:"DELETE"});
+  currentClient=null; $("tabs").style.display="none"; $("clientTitle").textContent="Flow Studio";
+  $("content").innerHTML='<div class="no-client"><div style="font-size:40px">🎬</div><div>Select a client.</div></div>';
+  loadClients();
+}
+
+// ---------- CALENDAR ----------
+async function renderCalendar(){
+  const isRss = currentClient.mode === "rss";
+  $("content").innerHTML = `
+    <div class="card">
+      ${isRss ? `
+        <div class="section-label">RSS news feeds</div>
+        <div class="hint" style="margin-bottom:10px">New articles are auto-fetched and turned into videos daily (up to ${currentClient.rss_daily_limit||3}/day). You can also pull them in now:</div>
+        <div class="btn-row">
+          <button class="btn btn-primary btn-sm" id="fetchRss" onclick="fetchRss()">Fetch feeds now</button>
+        </div>
+      ` : `
+        <div class="section-label">Generate content calendar (Groq)</div>
+        <div class="btn-row">
+          <label>Days <input type="number" id="calDays" value="7" min="1" max="30" style="width:70px;display:inline-block"></label>
+          <label>Start <input type="text" id="calStart" placeholder="YYYY-MM-DD (optional)" style="width:160px;display:inline-block"></label>
+          <button class="btn btn-primary btn-sm" id="genCal" onclick="genCalendar()">Generate calendar</button>
+        </div>
+      `}
+    </div>
+    <div id="calList"><div class="hint">Loading…</div></div>`;
+  const items = await api("/api/clients/"+currentClient.id+"/calendar");
+  renderCalList(items);
+}
+async function fetchRss(){
+  const btn=$("fetchRss"); btn.disabled=true; btn.textContent="Fetching…";
+  try{
+    const r = await api("/api/clients/"+currentClient.id+"/rss/fetch",{method:"POST"});
+    toast(`Fetched ${r.fetched}, ${r.new} new article(s)`);
+    renderCalendar();
+  }catch(e){ toast("Error: "+e.message); }
+  if($("fetchRss")){ btn.disabled=false; btn.textContent="Fetch feeds now"; }
+}
+let CAL_ITEMS = [];
+function renderCalList(items){
+  CAL_ITEMS = items || [];
+  const el=$("calList");
+  if(!items.length){ el.innerHTML='<div class="hint">'+(currentClient.mode==='rss'?'No articles yet. Click “Fetch feeds now”.':'No calendar yet. Generate one above.')+'</div>'; return; }
+  el.innerHTML = items.map(it=>`
+    <div class="cal-item">
+      <div class="cal-date">${it.scheduled_date||""}</div>
+      <div class="cal-body">
+        <div class="cal-topic">${esc(it.topic)} <span class="pill ${it.status==='done'?'green':it.status==='prompt_ready'?'accent':it.status==='generating'?'gold':''}">${it.status}</span></div>
+        ${it.hook?`<div class="cal-hook">${esc(it.hook)}</div>`:""}
+        ${it.prompt?`<div class="cal-prompt">${esc(it.prompt)}</div>`:""}
+        <div class="btn-row">
+          <button class="btn btn-sm" onclick="makePrompt('${it.id}')">${it.prompt?'Regenerate':'Make'} prompt</button>
+          <button class="btn btn-primary btn-sm" onclick="genFromCalendar('${it.id}')">Generate video</button>
+        </div>
+      </div>
+    </div>`).join("");
+}
+async function genCalendar(){
+  const btn=$("genCal"); btn.disabled=true; btn.textContent="Generating…";
+  try{
+    const body={days:Number($("calDays").value)||7}; const s=$("calStart").value.trim(); if(s) body.startDate=s;
+    await api("/api/clients/"+currentClient.id+"/calendar/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    renderCalendar(); toast("Calendar generated ✓");
+  }catch(e){ toast("Error: "+e.message); }
+  btn.disabled=false; btn.textContent="Generate calendar";
+}
+async function makePrompt(itemId){
+  toast("Generating prompt…");
+  try{ await api("/api/calendar/"+itemId+"/prompt",{method:"POST"}); renderCalendar(); }
+  catch(e){ toast("Error: "+e.message); }
+}
+async function genFromCalendar(itemId){
+  let item = CAL_ITEMS.find(x=>x.id===itemId);
+  // ensure a script exists; generate one if missing
+  if(item && !item.prompt){
+    toast("Writing script…");
+    try{ item = await api("/api/calendar/"+itemId+"/prompt",{method:"POST"}); }catch(e){ toast("Error: "+e.message); }
+  }
+  switchTab("generate");
+  setTimeout(()=>{
+    $("genCalItem").value = itemId;
+    $("genTopic").value = item ? item.topic : "";
+    if(item && item.prompt) $("genPrompt").value = item.prompt;   // load the SCRIPT
+    toast("Script loaded — click Generate Video");
+  }, 60);
+}
+
+// ---------- GENERATE ----------
+function renderGenerate(){
+  $("content").innerHTML = `
+    <div class="gen-grid">
+      <div>
+        <div class="card">
+          <div class="section-label">Generate a video</div>
+          <input type="hidden" id="genCalItem">
+          <input type="hidden" id="genTopic">
+          <div class="field"><label>Script / prompt (scene-cut; leave blank to auto-generate from a calendar item)</label>
+            <textarea id="genPrompt" style="min-height:160px" placeholder="A 10-second cinematic vertical 9:16 video.&#10;Scene 1 (0-2 sec): …&#10;Scene 2 (2-4 sec): …&#10;Voiceover (off-screen): &quot;…&quot;&#10;Style: …"></textarea></div>
+          <div class="field"><label>Reference image (optional — overrides the client's fixed one)</label>
+            <div class="upload-zone"><input type="file" id="genImage" accept="image/*"><div>🖼️ Reference image</div>
+              <div class="upload-name" id="genImageName">${currentClient && currentClient.reference_image_path ? 'Using fixed: '+esc(currentClient.reference_image_path) : ''}</div></div></div>
+          <button class="btn btn-primary" id="genBtn" onclick="startGenerate()">Generate Video</button>
+          <div class="hint">Always renders 10s · Omni · 9:16, then applies the frame + outro and uploads per config.</div>
+        </div>
+        <video id="genPreview" class="preview-video" controls loop autoplay muted></video>
+      </div>
+      <div>
+        <div class="section-label">Console</div>
+        <div class="log-body" id="genLog"><div class="hint">Logs will stream here.</div></div>
+      </div>
+    </div>`;
+  bindName("genImage","genImageName");
+}
+function addLog(type,msg,ts){
+  const body=$("genLog"); const h=body.querySelector(".hint"); if(h) h.remove();
+  const line=document.createElement("div"); line.className="log-line "+type;
+  const t=new Date(ts||Date.now()).toTimeString().slice(0,8);
+  line.innerHTML=`<span class="log-ts">${t}</span><span class="log-msg">${esc(msg)}</span>`;
+  body.appendChild(line); body.scrollTop=body.scrollHeight;
+}
+async function startGenerate(){
+  const btn=$("genBtn"); btn.disabled=true; btn.textContent="Generating…";
+  $("genLog").innerHTML=""; $("genPreview").style.display="none";
+  try{
+    const fd=new FormData();
+    const p=$("genPrompt").value.trim(); if(p) fd.append("prompt",p);
+    const ci=$("genCalItem").value; if(ci) fd.append("calendar_item_id",ci);
+    const tp=$("genTopic").value.trim(); if(tp) fd.append("topic",tp);
+    if($("genImage").files[0]) fd.append("image",$("genImage").files[0]);
+    const {jobId}=await api("/api/clients/"+currentClient.id+"/generate",{method:"POST",body:fd});
+    connectWS(jobId);
+  }catch(e){ addLog("error",e.message); toast("Error: "+e.message); btn.disabled=false; btn.textContent="Generate Video"; }
+}
+function connectWS(jobId){
+  if(ws) ws.close();
+  const proto=location.protocol==="https:"?"wss":"ws";
+  ws=new WebSocket(`${proto}://${location.host}?jobId=${jobId}`);
+  ws.onmessage=(evt)=>{
+    const m=JSON.parse(evt.data);
+    if(m.type==="video"){ const v=$("genPreview"); v.src="/outputs/"+m.message; v.style.display="block"; return; }
+    addLog(m.type,m.message,m.ts);
+    if(m.message.includes("🏁")||m.type==="error"&&m.message.includes("failed")){
+      const b=$("genBtn"); if(b){b.disabled=false;b.textContent="Generate Video";}
+    }
+  };
+  ws.onerror=()=>addLog("error","WebSocket error");
+}
+
+// ---------- VIDEOS ----------
+async function renderVideos(){
+  $("content").innerHTML='<div class="hint">Loading…</div>';
+  const vids=await api("/api/clients/"+currentClient.id+"/videos");
+  if(!vids.length){ $("content").innerHTML='<div class="hint">No videos yet. Generate one from the Calendar or Generate tab.</div>'; return; }
+  $("content").innerHTML=`<div class="vid-grid">`+vids.map(v=>{
+    const file=v.final_file||v.raw_file;
+    return `<div class="vid-card">
+      ${file?`<video src="/outputs/${esc(file)}" controls loop muted></video>`:`<div style="aspect-ratio:9/16;display:flex;align-items:center;justify-content:center;background:#000;color:var(--muted);font-size:12px">${esc(v.status)}</div>`}
+      <div class="vid-meta">
+        <div class="vid-title">${esc(v.title||"Untitled")}</div>
+        <span class="pill ${v.status==='uploaded'?'green':v.status==='error'?'red':v.status==='generating'?'gold':'accent'}">${esc(v.status)}</span>
+        <div class="vid-links">
+          ${v.drive_url?`<a href="${esc(v.drive_url)}" target="_blank">📁 Drive</a>`:""}
+          ${v.youtube_url?`<a href="${esc(v.youtube_url)}" target="_blank">📺 YouTube</a>`:""}
+          ${file?`<a href="/outputs/${esc(file)}" download>⬇ Download</a>`:""}
+        </div>
+      </div></div>`;
+  }).join("")+`</div>`;
+}
+
+loadClients();
+</script>
+</body>
+</html>

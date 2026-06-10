@@ -1,0 +1,29 @@
+name: Build & Deploy to Render
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:        # manual "Run workflow" button
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Syntax check
+        run: node --check server.js && for f in lib/*.js; do node --check "$f"; done
+      - name: Docker build test
+        run: docker build -t flow-studio-test .
+
+  deploy:
+    needs: check
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Trigger Render deploy
+        run: curl -fsS "${{ secrets.RENDER_DEPLOY_HOOK_URL }}"
