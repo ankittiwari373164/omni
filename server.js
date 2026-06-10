@@ -17,6 +17,7 @@ const googleLib = require("./lib/google");
 const rssLib = require("./lib/rss");
 const feedsLib = require("./lib/feeds");
 const { buildScript } = require("./lib/flow");
+const assetsLib = require("./lib/assets");
 
 const app = express();
 const server = http.createServer(app);
@@ -26,6 +27,13 @@ app.use(cors());
 app.use(express.json({ limit: "5mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 app.use("/outputs", express.static(path.join(__dirname, "outputs")));
+// /assets: serve from local cache, fall back to Supabase Storage (free-tier disk is ephemeral)
+app.get("/assets/:name", async (req, res) => {
+  const name = path.basename(req.params.name); // prevent path traversal
+  const local = await assetsLib.fetchAsset(name);
+  if (!local) return res.status(404).send("asset not found");
+  res.sendFile(local);
+});
 app.use("/assets", express.static(path.join(__dirname, "assets")));
 
 const upload = multer({ dest: "uploads/" });
@@ -52,13 +60,14 @@ function sendLog(jobId, type, message) {
   console.log(`[${jobId.slice(0, 6)}] ${message}`);
 }
 
-// helper: persist an uploaded file into assets/ with a stable name
-function saveAsset(file, prefix) {
+// helper: persist an uploaded file into assets/ AND Supabase Storage (source of truth)
+async function saveAsset(file, prefix) {
   if (!file) return null;
   const ext = path.extname(file.originalname) || "";
   const name = `${prefix}_${Date.now()}${ext}`;
   const dest = path.join(__dirname, "assets", name);
   fs.renameSync(file.path, dest);
+  await assetsLib.uploadAsset(dest, name);
   return name;
 }
 
@@ -145,14 +154,16 @@ app.post("/api/clients/:id/config", upload.fields([
     try { patch.cookies = JSON.parse(b.cookies); }
     catch { return res.status(400).json({ error: "cookies must be valid JSON" }); }
   }
-  if (req.files?.frame?.[0]) patch.frame_path = saveAsset(req.files.frame[0], `frame_${req.params.id}`);
-  if (req.files?.outro?.[0]) patch.outro_path = saveAsset(req.files.outro[0], `outro_${req.params.id}`);
+  if (req.files?.frame?.[0]) patch.frame_path = await saveAsset(req.files.frame[0], `frame_${req.params.id}`);
+  if (req.files?.outro?.[0]) patch.outro_path = await saveAsset(req.files.outro[0], `outro_${req.params.id}`);
   if (req.files?.reference_image?.[0]) {
     // store with original extension so Flow accepts the format
     const f = req.files.reference_image[0];
     const ext = path.extname(f.originalname).toLowerCase() || ".png";
     const name = `ref_${req.params.id}_${Date.now()}${ext}`;
-    fs.renameSync(f.path, path.join(__dirname, "assets", name));
+    const dest = path.join(__dirname, "assets", name);
+    fs.renameSync(f.path, dest);
+    await assetsLib.uploadAsset(dest, name);   // source of truth: Supabase Storage
     patch.reference_image_path = name;
   }
 
@@ -282,9 +293,8 @@ app.post("/api/clients/:id/generate", upload.fields([{ name: "image", maxCount: 
       imagePath = orig.path + ext;
       fs.renameSync(orig.path, imagePath);
     } else if (client.reference_image_path) {
-      // use the client's fixed reference image stored in assets/
-      const ref = path.join(__dirname, "assets", client.reference_image_path);
-      if (fs.existsSync(ref)) imagePath = ref;
+      // use the client's fixed reference image (local cache or Supabase Storage)
+      imagePath = await assetsLib.fetchAsset(client.reference_image_path);
     }
 
     const jobId = uuidv4();
@@ -374,8 +384,8 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
     // ---- composite frame + outro ----
     let finalName = rawVideoFile;
     try {
-      const framePng = client.frame_path ? path.join(__dirname, "assets", client.frame_path) : null;
-      const outroClip = client.outro_path ? path.join(__dirname, "assets", client.outro_path) : null;
+      const framePng = client.frame_path ? await assetsLib.fetchAsset(client.frame_path) : null;
+      const outroClip = client.outro_path ? await assetsLib.fetchAsset(client.outro_path) : null;
 
       if (framePng || outroClip) {
         sendLog(jobId, "progress", "🎨 Compositing (frame · outro)…");
@@ -475,16 +485,13 @@ function generateOne({ client, prompt, topic, calItemId, link }) {
   const cookiesPath = path.join(__dirname, "uploads", `cookies_${uuidv4()}.json`);
   fs.writeFileSync(cookiesPath, JSON.stringify(client.cookies));
 
-  let imagePath = null;
-  if (client.reference_image_path) {
-    const ref = path.join(__dirname, "assets", client.reference_image_path);
-    if (fs.existsSync(ref)) imagePath = ref;
-  }
-
   const jobId = uuidv4();
   jobs.set(jobId, { logs: [], ws: null });
 
   return (async () => {
+    let imagePath = null;
+    if (client.reference_image_path) imagePath = await assetsLib.fetchAsset(client.reference_image_path);
+
     const { data: videoRow } = await supabase.from("videos").insert({
       client_id: client.id, calendar_item_id: calItemId || null, prompt,
       title: topic || client.name, status: "generating"

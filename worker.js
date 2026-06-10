@@ -26,6 +26,7 @@ const googleLib = require("./lib/google");
 const rssLib = require("./lib/rss");
 const feedsLib = require("./lib/feeds");
 const { buildScript } = require("./lib/flow");
+const assetsLib = require("./lib/assets");
 
 ["uploads", "outputs", "assets"].forEach(d => fs.mkdirSync(path.join(__dirname, d), { recursive: true }));
 
@@ -40,17 +41,10 @@ function applyTpl(tpl, vars) {
 }
 
 // ── core pipeline (mirrors server.js runPipeline, console-only) ──────
-function runFlow({ client, prompt, jobId }) {
+function runFlow({ client, prompt, jobId, imagePath }) {
   return new Promise((resolve) => {
     const cookiesPath = path.join(__dirname, "uploads", `cookies_${uuidv4()}.json`);
     fs.writeFileSync(cookiesPath, JSON.stringify(client.cookies));
-
-    let imagePath = null;
-    if (client.reference_image_path) {
-      const ref = path.join(__dirname, "assets", client.reference_image_path);
-      if (fs.existsSync(ref)) imagePath = ref;
-      else log(`⚠️  reference image ${client.reference_image_path} not in repo assets/ — generating without it`);
-    }
 
     const scriptPath = path.join(__dirname, "uploads", `script_${jobId}.js`);
     fs.writeFileSync(scriptPath, buildScript({
@@ -86,7 +80,11 @@ async function processVideo({ client, videoRow, prompt, topic }) {
   log(`🚀 ${client.name} — "${(topic || prompt).slice(0, 70)}"`);
   await supabase.from("videos").update({ status: "generating" }).eq("id", videoRow.id);
 
-  const { rawVideoFile, code } = await runFlow({ client, prompt, jobId });
+  // pull this client's assets from Supabase Storage (runner disk is empty)
+  const imagePath = client.reference_image_path ? await assetsLib.fetchAsset(client.reference_image_path) : null;
+  if (client.reference_image_path && !imagePath) log("⚠️  reference image not in Supabase Storage — generating without it");
+
+  const { rawVideoFile, code } = await runFlow({ client, prompt, jobId, imagePath });
   if (!rawVideoFile) {
     log(`❌ Flow generation failed (exit ${code})`);
     await supabase.from("videos").update({ status: "error", error: "flow generation failed" }).eq("id", videoRow.id);
@@ -96,21 +94,18 @@ async function processVideo({ client, videoRow, prompt, topic }) {
   }
   await supabase.from("videos").update({ raw_file: rawVideoFile }).eq("id", videoRow.id);
 
-  // composite frame + outro
+  // composite frame + outro (fetched from Supabase Storage)
   let finalName = rawVideoFile;
   try {
-    const framePng = client.frame_path ? path.join(__dirname, "assets", client.frame_path) : null;
-    const outroClip = client.outro_path ? path.join(__dirname, "assets", client.outro_path) : null;
-    const frameOk = framePng && fs.existsSync(framePng);
-    const outroOk = outroClip && fs.existsSync(outroClip);
-    if ((framePng && !frameOk) || (outroClip && !outroOk))
-      log("⚠️  frame/outro configured but file missing from repo assets/ — commit it");
-    if (frameOk || outroOk) {
+    const framePng = client.frame_path ? await assetsLib.fetchAsset(client.frame_path) : null;
+    const outroClip = client.outro_path ? await assetsLib.fetchAsset(client.outro_path) : null;
+    if ((client.frame_path && !framePng) || (client.outro_path && !outroClip))
+      log("⚠️  frame/outro configured but missing in Supabase Storage — re-upload it in the dashboard Config");
+    if (framePng || outroClip) {
       log("🎨 Compositing frame/outro…");
       const finalPath = await videoLib.compose({
         videoIn: path.join(__dirname, "outputs", rawVideoFile),
-        framePng: frameOk ? framePng : null,
-        outroClip: outroOk ? outroClip : null,
+        framePng, outroClip,
         outDir: path.join(__dirname, "outputs"),
         baseName: path.parse(rawVideoFile).name
       });
