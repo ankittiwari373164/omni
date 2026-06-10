@@ -6,8 +6,6 @@ services:
     healthCheckPath: /
     autoDeploy: true
     envVars:
-      - key: PORT
-        value: "3000"
       - key: RUN_JOBS
         value: "false"        # queue jobs instead of running Playwright/ffmpeg here
       - key: SUPABASE_URL
