@@ -37,3 +37,12 @@ jobs:
           GOOGLE_REDIRECT_URI: ${{ secrets.GOOGLE_REDIRECT_URI }}
           WORKER_MAX_VIDEOS: "4"
         run: xvfb-run --auto-servernum --server-args="-screen 0 1280x800x24" node worker.js
+
+      - name: Upload debug screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flow-debug-screenshots
+          path: outputs/debug_*.png
+          if-no-files-found: ignore
+          retention-days: 5
