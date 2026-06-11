@@ -513,6 +513,14 @@ function waitUntilFree(timeoutMs = 20 * 60 * 1000) {
 }
 
 // Resolve a client's effective feed list: chosen categories + any custom URLs.
+// strip tracking params/fragments so the same article always compares equal
+function normLink(u) {
+  try { const url = new URL(u); url.search = ""; url.hash = "";
+    return url.toString().replace(/\/+$/, "").toLowerCase();
+  } catch { return String(u || "").trim().toLowerCase(); }
+}
+const normTitle = (t) => String(t || "").trim().toLowerCase().replace(/\s+/g, " ");
+
 function clientFeeds(client) {
   const cats = String(client.rss_categories || "").split(",").map(s => s.trim()).filter(Boolean);
   const catUrls = feedsLib.feedsForCategories(cats);
@@ -530,9 +538,10 @@ app.post("/api/clients/:id/rss/fetch", async (req, res) => {
 
     const items = await rssLib.fetchFeeds(feeds, 20);
     const { data: existing } = await supabase.from("calendar_items")
-      .select("link").eq("client_id", client.id).not("link", "is", null);
-    const have = new Set((existing || []).map(e => e.link));
-    const fresh = items.filter(i => !have.has(i.link));
+      .select("link, topic").eq("client_id", client.id);
+    const haveLinks = new Set((existing || []).map(e => normLink(e.link)).filter(Boolean));
+    const haveTitles = new Set((existing || []).map(e => normTitle(e.topic)).filter(Boolean));
+    const fresh = items.filter(i => !haveLinks.has(normLink(i.link)) && !haveTitles.has(normTitle(i.title)));
 
     let inserted = [];
     if (fresh.length) {
@@ -567,9 +576,12 @@ async function runRssScheduler() {
     try {
       const items = await rssLib.fetchFeeds(feeds, 20);
       const { data: existing } = await supabase.from("calendar_items")
-        .select("link").eq("client_id", client.id).not("link", "is", null);
-      const have = new Set((existing || []).map(e => e.link));
-      const fresh = items.filter(i => !have.has(i.link)).slice(0, client.rss_daily_limit || 3);
+        .select("link, topic").eq("client_id", client.id);
+      const haveLinks = new Set((existing || []).map(e => normLink(e.link)).filter(Boolean));
+      const haveTitles = new Set((existing || []).map(e => normTitle(e.topic)).filter(Boolean));
+      const fresh = items
+        .filter(i => !haveLinks.has(normLink(i.link)) && !haveTitles.has(normTitle(i.title)))
+        .slice(0, client.rss_daily_limit || 3);
 
       console.log(`📰 RSS [${client.name}] ${fresh.length} new article(s) to generate`);
       for (const it of fresh) {

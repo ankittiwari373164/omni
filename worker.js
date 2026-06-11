@@ -189,6 +189,16 @@ function clientFeeds(client) {
   return [...new Set([...catUrls, ...custom])].join("\n");
 }
 
+// strip tracking params/fragments so the same article always compares equal
+function normLink(u) {
+  try {
+    const url = new URL(u);
+    url.search = ""; url.hash = "";
+    return url.toString().replace(/\/+$/, "").toLowerCase();
+  } catch { return String(u || "").trim().toLowerCase(); }
+}
+const normTitle = (t) => String(t || "").trim().toLowerCase().replace(/\s+/g, " ");
+
 async function runRssOnce() {
   const today = new Date().toISOString().slice(0, 10);
   const { data: clients } = await supabase.from("clients").select("*").eq("mode", "rss");
@@ -200,10 +210,14 @@ async function runRssOnce() {
 
     try {
       const items = await rssLib.fetchFeeds(feeds, 20);
+      // dedupe against BOTH link (normalized) and title of everything already generated
       const { data: existing } = await supabase.from("calendar_items")
-        .select("link").eq("client_id", client.id).not("link", "is", null);
-      const have = new Set((existing || []).map(e => e.link));
-      const fresh = items.filter(i => !have.has(i.link)).slice(0, client.rss_daily_limit || 3);
+        .select("link, topic").eq("client_id", client.id);
+      const haveLinks = new Set((existing || []).map(e => normLink(e.link)).filter(Boolean));
+      const haveTitles = new Set((existing || []).map(e => normTitle(e.topic)).filter(Boolean));
+      const fresh = items
+        .filter(i => !haveLinks.has(normLink(i.link)) && !haveTitles.has(normTitle(i.title)))
+        .slice(0, client.rss_daily_limit || 3);
       log(`📰 RSS [${client.name}] ${fresh.length} new article(s)`);
 
       for (const it of fresh) {
