@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "0 */2 * * *"   # every 2 hours (UTC). Note: GitHub may delay scheduled runs.
   workflow_dispatch:         # manual "Run workflow" button for instant processing
+    inputs:
+      skip_image:
+        description: "Generate text-only (skip reference image) for testing"
+        type: boolean
+        default: false
 
 concurrency:
   group: video-worker        # never two workers at once (Flow session conflicts)
@@ -40,6 +45,7 @@ jobs:
           PROXY_USERNAME: ${{ secrets.PROXY_USERNAME }}
           PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
           WORKER_MAX_VIDEOS: "4"
+          SKIP_IMAGE: ${{ github.event.inputs.skip_image == 'true' && '1' || '' }}
         run: xvfb-run --auto-servernum --server-args="-screen 0 1280x800x24" node worker.js
 
       - name: Upload debug screenshots
