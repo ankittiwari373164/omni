@@ -26,9 +26,9 @@ const googleLib = require("./lib/google");
 const rssLib = require("./lib/rss");
 const feedsLib = require("./lib/feeds");
 const { buildScript } = require("./lib/flow");
-const assetsLib = require("./lib/assets");
-const veoLib     = require("./lib/veo");
+const assetsLib  = require("./lib/assets");
 const flowApiLib = require("./lib/flow-api");
+const veoLib     = (() => { try { return require("./lib/veo"); } catch { return null; } })();
 
 ["uploads", "outputs", "assets"].forEach(d => fs.mkdirSync(path.join(__dirname, d), { recursive: true }));
 
@@ -88,7 +88,7 @@ async function processVideo({ client, videoRow, prompt, topic }) {
 
   let rawVideoFile = null;
 
-  if (process.env.GEMINI_API_KEY) {
+  if (process.env.GEMINI_API_KEY && veoLib) {
     // Path 1: Official Veo API
     try {
       rawVideoFile = await veoLib.generateVideo({
