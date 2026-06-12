@@ -9,13 +9,15 @@ on:
         description: "Generate text-only (skip reference image) for testing"
         type: boolean
         default: false
+
+concurrency:
   group: video-worker
   cancel-in-progress: false
 
 jobs:
   worker:
     runs-on: ubuntu-latest
-    timeout-minutes: 30          # much faster now — no browser, no Chromium download
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
