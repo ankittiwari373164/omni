@@ -2,8 +2,8 @@ name: Video Worker
 
 on:
   schedule:
-    - cron: "0 */2 * * *"   # every 2 hours (UTC). Note: GitHub may delay scheduled runs.
-  workflow_dispatch:         # manual "Run workflow" button for instant processing
+    - cron: "0 */2 * * *"
+  workflow_dispatch:
     inputs:
       skip_image:
         description: "Generate text-only (skip reference image) for testing"
@@ -11,13 +11,13 @@ on:
         default: false
 
 concurrency:
-  group: video-worker        # never two workers at once (Flow session conflicts)
+  group: video-worker
   cancel-in-progress: false
 
 jobs:
   worker:
-    runs-on: ubuntu-latest   # ffmpeg is preinstalled on this runner
-    timeout-minutes: 110
+    runs-on: ubuntu-latest
+    timeout-minutes: 30          # much faster now — no browser, no Chromium download
     steps:
       - uses: actions/checkout@v4
 
@@ -28,9 +28,6 @@ jobs:
 
       - run: npm ci
 
-      - name: Install Chromium for Playwright
-        run: npx playwright install --with-deps chromium
-
       - name: Run worker (queue + RSS)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -40,19 +37,8 @@ jobs:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REDIRECT_URI: ${{ secrets.GOOGLE_REDIRECT_URI }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          PROXY_SERVER: ${{ secrets.PROXY_SERVER }}
-          PROXY_USERNAME: ${{ secrets.PROXY_USERNAME }}
-          PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
+          CAPTCHA_SERVICE: ${{ secrets.CAPTCHA_SERVICE }}
+          CAPTCHA_API_KEY: ${{ secrets.CAPTCHA_API_KEY }}
           WORKER_MAX_VIDEOS: "4"
           SKIP_IMAGE: ${{ github.event.inputs.skip_image == 'true' && '1' || '' }}
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x800x24" node worker.js
-
-      - name: Upload debug screenshots
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: flow-debug-screenshots
-          path: outputs/debug_*.png
-          if-no-files-found: ignore
-          retention-days: 5
+        run: node worker.js

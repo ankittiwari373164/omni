@@ -27,6 +27,8 @@ const rssLib = require("./lib/rss");
 const feedsLib = require("./lib/feeds");
 const { buildScript } = require("./lib/flow");
 const assetsLib = require("./lib/assets");
+const veoLib     = require("./lib/veo");
+const flowApiLib = require("./lib/flow-api");
 
 ["uploads", "outputs", "assets"].forEach(d => fs.mkdirSync(path.join(__dirname, d), { recursive: true }));
 
@@ -84,13 +86,56 @@ async function processVideo({ client, videoRow, prompt, topic }) {
   const imagePath = client.reference_image_path ? await assetsLib.fetchAsset(client.reference_image_path) : null;
   if (client.reference_image_path && !imagePath) log("⚠️  reference image not in Supabase Storage — generating without it");
 
-  const { rawVideoFile, code } = await runFlow({ client, prompt, jobId, imagePath });
+  let rawVideoFile = null;
+
+  if (process.env.GEMINI_API_KEY) {
+    // Path 1: Official Veo API
+    try {
+      rawVideoFile = await veoLib.generateVideo({
+        prompt: String(prompt).replace(/\s*\n+\s*/g, " ").trim(),
+        imagePath, aspectRatio: "9:16", durationSeconds: 8,
+        outDir: path.join(__dirname, "outputs"),
+        baseName: `veo_${jobId}`, onLog: (m) => log(m)
+      });
+    } catch (e) { log(`Veo API failed: ${e.message}`); }
+
+  } else if (process.env.CAPTCHA_API_KEY) {
+    // Path 2: Direct Flow API + captcha solving (no browser, uses Omni Flash credits)
+    try {
+      log(`🔑 Using direct Flow API with captcha solving (${process.env.CAPTCHA_SERVICE || "anticaptcha"})`);
+      rawVideoFile = await flowApiLib.generateVideo({
+        cookies: client.cookies,
+        prompt: String(prompt).replace(/\s*\n+\s*/g, " ").trim(),
+        imagePath, aspectRatio: "portrait", duration: 8,
+        outDir: path.join(__dirname, "outputs"),
+        baseName: `flow_${jobId}`, onLog: (m) => log(m)
+      });
+    } catch (e) { log(`Flow direct API failed: ${e.message}`); }
+
+  } else {
+    // Path 3: Browser automation (Playwright) — fallback, often flagged on CI
+    log("No GEMINI_API_KEY or CAPTCHA_API_KEY set — using browser automation (may be flagged)");
+  }
+
   if (!rawVideoFile) {
-    log(`❌ Flow generation failed (exit ${code})`);
-    await supabase.from("videos").update({ status: "error", error: "flow generation failed" }).eq("id", videoRow.id);
-    if (videoRow.calendar_item_id)
-      await supabase.from("calendar_items").update({ status: "error" }).eq("id", videoRow.calendar_item_id);
-    return false;
+    // Fallback: Flow browser automation (often flagged on datacenter IPs)
+    if (!client.cookies) {
+      log("❌ Veo failed and no Flow cookies available — cannot generate");
+      await supabase.from("videos").update({ status: "error", error: "generation failed (no fallback)" }).eq("id", videoRow.id);
+      if (videoRow.calendar_item_id)
+        await supabase.from("calendar_items").update({ status: "error" }).eq("id", videoRow.calendar_item_id);
+      return false;
+    }
+    log(process.env.GEMINI_API_KEY ? "Falling back to Flow browser automation…" : "GEMINI_API_KEY not set — using Flow browser automation");
+    const flowRes = await runFlow({ client, prompt, jobId, imagePath });
+    rawVideoFile = flowRes.rawVideoFile;
+    if (!rawVideoFile) {
+      log(`❌ Generation failed on all paths`);
+      await supabase.from("videos").update({ status: "error", error: "generation failed" }).eq("id", videoRow.id);
+      if (videoRow.calendar_item_id)
+        await supabase.from("calendar_items").update({ status: "error" }).eq("id", videoRow.calendar_item_id);
+      return false;
+    }
   }
   await supabase.from("videos").update({ raw_file: rawVideoFile }).eq("id", videoRow.id);
 
@@ -175,7 +220,7 @@ async function processQueue() {
   for (const v of queued) {
     if (processed >= MAX_VIDEOS_PER_RUN) { log("Per-run limit reached; rest stays queued."); return; }
     const { data: client } = await supabase.from("clients").select("*").eq("id", v.client_id).single();
-    if (!client?.cookies) { log(`Skipping ${v.id} — client missing cookies`); continue; }
+    if (!client?.cookies && !process.env.GEMINI_API_KEY) { log(`Skipping ${v.id} — client missing cookies and no GEMINI_API_KEY`); continue; }
     await processVideo({ client, videoRow: v, prompt: v.prompt, topic: v.title });
     processed++;
   }
@@ -205,7 +250,7 @@ async function runRssOnce() {
   for (const client of clients || []) {
     if (client.last_rss_run === today) continue;
     const feeds = clientFeeds(client);
-    if (!client.cookies || !feeds) continue;
+    if ((!client.cookies && !process.env.GEMINI_API_KEY) || !feeds) continue;
     if (processed >= MAX_VIDEOS_PER_RUN) { log("Per-run limit reached; RSS continues next run."); return; }
 
     try {
