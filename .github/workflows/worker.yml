@@ -28,6 +28,9 @@ jobs:
 
       - run: npm ci
 
+      - name: Install Chromium for token generation
+        run: npx playwright install --with-deps chromium
+
       - name: Run worker (queue + RSS)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -41,4 +44,4 @@ jobs:
           CAPTCHA_API_KEY: ${{ secrets.CAPTCHA_API_KEY }}
           WORKER_MAX_VIDEOS: "4"
           SKIP_IMAGE: ${{ github.event.inputs.skip_image == 'true' && '1' || '' }}
-        run: node worker.js
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x800x24" node worker.js
