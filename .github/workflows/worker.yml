@@ -9,8 +9,6 @@ on:
         description: "Generate text-only (skip reference image) for testing"
         type: boolean
         default: false
-
-concurrency:
   group: video-worker
   cancel-in-progress: false
 
@@ -45,3 +43,12 @@ jobs:
           WORKER_MAX_VIDEOS: "4"
           SKIP_IMAGE: ${{ github.event.inputs.skip_image == 'true' && '1' || '' }}
         run: xvfb-run --auto-servernum --server-args="-screen 0 1280x800x24" node worker.js
+
+      - name: Upload debug screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flow-debug-screenshots
+          path: outputs/debug_*.png
+          if-no-files-found: ignore
+          retention-days: 3
