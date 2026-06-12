@@ -9,15 +9,31 @@ on:
         description: "Generate text-only (skip reference image) for testing"
         type: boolean
         default: false
+      vpn_provider:
+        description: "Route the runner through a VPN for a fresh/Indian IP (fixes 403 'unusual activity' / 429). Per-account proxies in Supabase still take precedence."
+        type: choice
+        options:
+          - windscribe
+          - protonvpn
+          - none
+        default: windscribe
+      vpn_country:
+        description: "VPN country code (IN = India). Windscribe free supports IN; ProtonVPN free does NOT (needs Plus)."
+        default: IN
 
 concurrency:
   group: video-worker
   cancel-in-progress: false
 
+env:
+  # Scheduled runs have no inputs, so fall back to these defaults.
+  VPN_PROVIDER: ${{ github.event.inputs.vpn_provider || 'windscribe' }}
+  VPN_COUNTRY: ${{ github.event.inputs.vpn_country || 'IN' }}
+
 jobs:
   worker:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -31,6 +47,73 @@ jobs:
       - name: Install Chromium for token generation
         run: npx playwright install --with-deps chromium
 
+      # ── VPN (optional, fail-soft) ──────────────────────────────────────
+      # Gives the runner a fresh / Indian exit IP so Google Flow stops
+      # returning 403 "unusual activity" or 429 "resource exhausted".
+      # NEVER hard-fails: if the VPN can't connect we log a warning and keep
+      # going, because per-account proxies (Supabase `proxy` column) or the
+      # global PROXY_SERVER secret may still carry the request.
+      - name: Connect VPN
+        if: ${{ env.VPN_PROVIDER != 'none' }}
+        env:
+          WINDSCRIBE_USERNAME: ${{ secrets.WINDSCRIBE_USERNAME }}
+          WINDSCRIBE_PASSWORD: ${{ secrets.WINDSCRIBE_PASSWORD }}
+          PROTONVPN_USERNAME: ${{ secrets.PROTONVPN_USERNAME }}
+          PROTONVPN_PASSWORD: ${{ secrets.PROTONVPN_PASSWORD }}
+        run: |
+          set +e
+          echo "Requested VPN: $VPN_PROVIDER ($VPN_COUNTRY)"
+          ip_before=$(curl -s --max-time 15 https://ipinfo.io/json || echo '{}')
+          echo "IP before VPN: $(echo "$ip_before" | tr -d '\n')"
+
+          if [ "$VPN_PROVIDER" = "windscribe" ]; then
+            if [ -z "$WINDSCRIBE_USERNAME" ] || [ -z "$WINDSCRIBE_PASSWORD" ]; then
+              echo "::warning::WINDSCRIBE_USERNAME / WINDSCRIBE_PASSWORD secrets not set — skipping VPN, relying on per-account / global proxy."
+              exit 0
+            fi
+            echo "Installing Windscribe CLI…"
+            curl -fsSL https://repo.windscribe.com/install/keys/release.asc \
+              | sudo gpg --dearmor -o /usr/share/keyrings/windscribe.gpg
+            echo "deb [arch=amd64 signed-by=/usr/share/keyrings/windscribe.gpg] https://repo.windscribe.com/ubuntu bionic main" \
+              | sudo tee /etc/apt/sources.list.d/windscribe-repo.list >/dev/null
+            sudo apt-get update -qq && sudo apt-get install -y -qq windscribe-cli || {
+              echo "::warning::Windscribe install failed — continuing without VPN."; exit 0; }
+            printf '%s\n%s\n' "$WINDSCRIBE_USERNAME" "$WINDSCRIBE_PASSWORD" | windscribe login || {
+              echo "::warning::Windscribe login failed — continuing without VPN."; exit 0; }
+            windscribe connect "$VPN_COUNTRY" || windscribe connect best || {
+              echo "::warning::Windscribe connect failed — continuing without VPN."; exit 0; }
+
+          elif [ "$VPN_PROVIDER" = "protonvpn" ]; then
+            if [ -z "$PROTONVPN_USERNAME" ] || [ -z "$PROTONVPN_PASSWORD" ]; then
+              echo "::warning::PROTONVPN_USERNAME / PROTONVPN_PASSWORD (OpenVPN creds) not set — skipping VPN."
+              exit 0
+            fi
+            if [ "$VPN_COUNTRY" = "IN" ]; then
+              echo "::warning::ProtonVPN FREE has no India servers — IN needs a Plus plan. Connecting to the requested country anyway; it may fall back to a free location."
+            fi
+            echo "Installing protonvpn-cli (community)…"
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq openvpn dialog python3-pip python3-setuptools || true
+            pip3 install --quiet protonvpn-cli || {
+              echo "::warning::protonvpn-cli install failed — continuing without VPN."; exit 0; }
+            mkdir -p ~/.pvpn-cli
+            # Non-interactive init: user / pass / plan(4=visionary, accepts free) / protocol(1=udp)
+            printf '%s\n%s\n%s\n4\n1\n' "$PROTONVPN_USERNAME" "$PROTONVPN_PASSWORD" "$PROTONVPN_USERNAME" \
+              | sudo protonvpn-cli init || true
+            sudo protonvpn-cli connect --cc "$VPN_COUNTRY" || sudo protonvpn-cli connect --fastest || {
+              echo "::warning::ProtonVPN connect failed — continuing without VPN."; exit 0; }
+          fi
+
+          sleep 8
+          ip_after=$(curl -s --max-time 20 https://ipinfo.io/json || echo '{}')
+          country=$(echo "$ip_after" | grep -o '"country": *"[^"]*"' | cut -d'"' -f4)
+          echo "IP after VPN: $(echo "$ip_after" | tr -d '\n')"
+          if [ -n "$country" ]; then
+            echo "Exit country: $country"
+            [ "$country" != "$VPN_COUNTRY" ] && echo "::warning::Exit country $country != requested $VPN_COUNTRY (still proceeding; a fresh IP often fixes 403/429 regardless)."
+          fi
+          exit 0
+
       - name: Run worker (queue + RSS)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -42,9 +125,23 @@ jobs:
           GOOGLE_REDIRECT_URI: ${{ secrets.GOOGLE_REDIRECT_URI }}
           CAPTCHA_SERVICE: ${{ secrets.CAPTCHA_SERVICE }}
           CAPTCHA_API_KEY: ${{ secrets.CAPTCHA_API_KEY }}
+          # Global proxy fallback — used only for clients whose Supabase `proxy`
+          # column is empty. Leave these secrets unset to disable.
+          PROXY_SERVER: ${{ secrets.PROXY_SERVER }}
+          PROXY_USERNAME: ${{ secrets.PROXY_USERNAME }}
+          PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
           WORKER_MAX_VIDEOS: "4"
           SKIP_IMAGE: ${{ github.event.inputs.skip_image == 'true' && '1' || '' }}
         run: xvfb-run --auto-servernum --server-args="-screen 0 1280x800x24" node worker.js
+
+      - name: Disconnect VPN
+        if: ${{ always() && env.VPN_PROVIDER != 'none' }}
+        run: |
+          set +e
+          windscribe disconnect 2>/dev/null
+          windscribe logout 2>/dev/null
+          sudo protonvpn-cli disconnect 2>/dev/null
+          echo "VPN cleanup done."
 
       - name: Upload debug screenshots
         if: always()

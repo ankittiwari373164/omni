@@ -45,7 +45,24 @@ function applyTpl(tpl, vars) {
 }
 
 // ── core pipeline (mirrors server.js runPipeline, console-only) ──────
-function runFlow({ client, prompt, jobId, imagePath }) {
+// Parse a proxy URL like "http://user:pass@host:port" or "socks5://host:port"
+// into the PROXY_SERVER / PROXY_USERNAME / PROXY_PASSWORD vars that flow.js reads.
+// Returns {} when no proxy is given so the global PROXY_SERVER secret (if any) is used.
+function proxyEnvFromUrl(proxyUrl) {
+  if (!proxyUrl || typeof proxyUrl !== "string" || !proxyUrl.trim()) return {};
+  try {
+    const u = new URL(proxyUrl.trim());
+    const env = { PROXY_SERVER: `${u.protocol}//${u.host}` };
+    if (u.username) env.PROXY_USERNAME = decodeURIComponent(u.username);
+    if (u.password) env.PROXY_PASSWORD = decodeURIComponent(u.password);
+    return env;
+  } catch {
+    // Not a URL — treat the whole value as the server (e.g. "1.2.3.4:8080")
+    return { PROXY_SERVER: proxyUrl.trim() };
+  }
+}
+
+function runFlow({ client, prompt, jobId, imagePath, proxyUrl }) {
   return new Promise((resolve) => {
     const cookiesPath = path.join(__dirname, "uploads", `cookies_${uuidv4()}.json`);
     fs.writeFileSync(cookiesPath, JSON.stringify(client.cookies));
@@ -57,9 +74,13 @@ function runFlow({ client, prompt, jobId, imagePath }) {
       aspectRatio: "9:16", speed: "1x", duration: "10s", jobId
     }));
 
+    // Per-client proxy overrides any global PROXY_SERVER inherited from process.env.
+    const proxyEnv = proxyEnvFromUrl(proxyUrl);
+    if (proxyEnv.PROXY_SERVER) log(`🌐 Routing ${client.name} through proxy ${proxyEnv.PROXY_SERVER}`);
+
     const proc = spawn("node", [scriptPath], {
       cwd: __dirname,
-      env: { ...process.env, NODE_ENV: "production", NODE_PATH: path.join(__dirname, "node_modules") }
+      env: { ...process.env, ...proxyEnv, NODE_ENV: "production", NODE_PATH: path.join(__dirname, "node_modules") }
     });
 
     let rawVideoFile = null;
@@ -143,7 +164,7 @@ async function processVideo({ client, videoRow, prompt, topic }) {
       return false;
     }
     log(process.env.GEMINI_API_KEY ? "Falling back to Flow browser automation…" : "GEMINI_API_KEY not set — using Flow browser automation");
-    const flowRes = await runFlow({ client, prompt, jobId, imagePath });
+    const flowRes = await runFlow({ client, prompt, jobId, imagePath, proxyUrl: client.proxy || null });
     rawVideoFile = flowRes.rawVideoFile;
     if (!rawVideoFile) {
       log(`❌ Generation failed on all paths`);

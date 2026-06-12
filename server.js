@@ -17,7 +17,6 @@ const googleLib = require("./lib/google");
 const rssLib = require("./lib/rss");
 const feedsLib = require("./lib/feeds");
 const { buildScript } = require("./lib/flow");
-const assetsLib = require("./lib/assets");
 
 const app = express();
 const server = http.createServer(app);
@@ -27,13 +26,6 @@ app.use(cors());
 app.use(express.json({ limit: "5mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 app.use("/outputs", express.static(path.join(__dirname, "outputs")));
-// /assets: serve from local cache, fall back to Supabase Storage (free-tier disk is ephemeral)
-app.get("/assets/:name", async (req, res) => {
-  const name = path.basename(req.params.name); // prevent path traversal
-  const local = await assetsLib.fetchAsset(name);
-  if (!local) return res.status(404).send("asset not found");
-  res.sendFile(local);
-});
 app.use("/assets", express.static(path.join(__dirname, "assets")));
 
 const upload = multer({ dest: "uploads/" });
@@ -60,14 +52,13 @@ function sendLog(jobId, type, message) {
   console.log(`[${jobId.slice(0, 6)}] ${message}`);
 }
 
-// helper: persist an uploaded file into assets/ AND Supabase Storage (source of truth)
-async function saveAsset(file, prefix) {
+// helper: persist an uploaded file into assets/ with a stable name
+function saveAsset(file, prefix) {
   if (!file) return null;
   const ext = path.extname(file.originalname) || "";
   const name = `${prefix}_${Date.now()}${ext}`;
   const dest = path.join(__dirname, "assets", name);
   fs.renameSync(file.path, dest);
-  await assetsLib.uploadAsset(dest, name);
   return name;
 }
 
@@ -154,16 +145,14 @@ app.post("/api/clients/:id/config", upload.fields([
     try { patch.cookies = JSON.parse(b.cookies); }
     catch { return res.status(400).json({ error: "cookies must be valid JSON" }); }
   }
-  if (req.files?.frame?.[0]) patch.frame_path = await saveAsset(req.files.frame[0], `frame_${req.params.id}`);
-  if (req.files?.outro?.[0]) patch.outro_path = await saveAsset(req.files.outro[0], `outro_${req.params.id}`);
+  if (req.files?.frame?.[0]) patch.frame_path = saveAsset(req.files.frame[0], `frame_${req.params.id}`);
+  if (req.files?.outro?.[0]) patch.outro_path = saveAsset(req.files.outro[0], `outro_${req.params.id}`);
   if (req.files?.reference_image?.[0]) {
     // store with original extension so Flow accepts the format
     const f = req.files.reference_image[0];
     const ext = path.extname(f.originalname).toLowerCase() || ".png";
     const name = `ref_${req.params.id}_${Date.now()}${ext}`;
-    const dest = path.join(__dirname, "assets", name);
-    fs.renameSync(f.path, dest);
-    await assetsLib.uploadAsset(dest, name);   // source of truth: Supabase Storage
+    fs.renameSync(f.path, path.join(__dirname, "assets", name));
     patch.reference_image_path = name;
   }
 
@@ -293,27 +282,31 @@ app.post("/api/clients/:id/generate", upload.fields([{ name: "image", maxCount: 
       imagePath = orig.path + ext;
       fs.renameSync(orig.path, imagePath);
     } else if (client.reference_image_path) {
-      // use the client's fixed reference image (local cache or Supabase Storage)
-      imagePath = await assetsLib.fetchAsset(client.reference_image_path);
+      // use the client's fixed reference image stored in assets/
+      const ref = path.join(__dirname, "assets", client.reference_image_path);
+      if (fs.existsSync(ref)) imagePath = ref;
     }
 
     const jobId = uuidv4();
     jobs.set(jobId, { logs: [], ws: null });
+
+    // When generation is disabled (e.g. on Render), queue the job for the
+    // local worker instance to pick up instead of running Playwright here.
+    if (process.env.RUN_JOBS === "false") {
+      const { data: videoRow } = await supabase.from("videos").insert({
+        client_id: client.id, calendar_item_id: calItemId, prompt,
+        title: topic || client.name, status: "queued"
+      }).select().single();
+      if (calItemId) await supabase.from("calendar_items").update({ status: "queued" }).eq("id", calItemId);
+      try { fs.unlinkSync(cookiesPath); } catch {}
+      return res.json({ jobId, videoId: videoRow.id, queued: true });
+    }
 
     // create the video DB row (pending)
     const { data: videoRow } = await supabase.from("videos").insert({
       client_id: client.id, calendar_item_id: calItemId, prompt,
       title: topic || client.name, status: "generating"
     }).select().single();
-
-    // Free-plan mode: don't run heavy jobs here — queue them for the GitHub Actions worker.
-    if (process.env.RUN_JOBS === "false") {
-      try { fs.unlinkSync(cookiesPath); } catch {}
-      await supabase.from("videos").update({ status: "queued" }).eq("id", videoRow.id);
-      if (calItemId) await supabase.from("calendar_items").update({ status: "queued" }).eq("id", calItemId);
-      jobs.get(jobId)?.logs.push({ type: "info", message: "Queued — the worker will pick this up on its next run.", ts: Date.now() });
-      return res.json({ jobId, videoId: videoRow.id, queued: true });
-    }
 
     res.json({ jobId, videoId: videoRow.id });
 
@@ -384,8 +377,8 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
     // ---- composite frame + outro ----
     let finalName = rawVideoFile;
     try {
-      const framePng = client.frame_path ? await assetsLib.fetchAsset(client.frame_path) : null;
-      const outroClip = client.outro_path ? await assetsLib.fetchAsset(client.outro_path) : null;
+      const framePng = client.frame_path ? path.join(__dirname, "assets", client.frame_path) : null;
+      const outroClip = client.outro_path ? path.join(__dirname, "assets", client.outro_path) : null;
 
       if (framePng || outroClip) {
         sendLog(jobId, "progress", "🎨 Compositing (frame · outro)…");
@@ -485,13 +478,16 @@ function generateOne({ client, prompt, topic, calItemId, link }) {
   const cookiesPath = path.join(__dirname, "uploads", `cookies_${uuidv4()}.json`);
   fs.writeFileSync(cookiesPath, JSON.stringify(client.cookies));
 
+  let imagePath = null;
+  if (client.reference_image_path) {
+    const ref = path.join(__dirname, "assets", client.reference_image_path);
+    if (fs.existsSync(ref)) imagePath = ref;
+  }
+
   const jobId = uuidv4();
   jobs.set(jobId, { logs: [], ws: null });
 
   return (async () => {
-    let imagePath = null;
-    if (client.reference_image_path) imagePath = await assetsLib.fetchAsset(client.reference_image_path);
-
     const { data: videoRow } = await supabase.from("videos").insert({
       client_id: client.id, calendar_item_id: calItemId || null, prompt,
       title: topic || client.name, status: "generating"
@@ -513,14 +509,6 @@ function waitUntilFree(timeoutMs = 20 * 60 * 1000) {
 }
 
 // Resolve a client's effective feed list: chosen categories + any custom URLs.
-// strip tracking params/fragments so the same article always compares equal
-function normLink(u) {
-  try { const url = new URL(u); url.search = ""; url.hash = "";
-    return url.toString().replace(/\/+$/, "").toLowerCase();
-  } catch { return String(u || "").trim().toLowerCase(); }
-}
-const normTitle = (t) => String(t || "").trim().toLowerCase().replace(/\s+/g, " ");
-
 function clientFeeds(client) {
   const cats = String(client.rss_categories || "").split(",").map(s => s.trim()).filter(Boolean);
   const catUrls = feedsLib.feedsForCategories(cats);
@@ -538,10 +526,9 @@ app.post("/api/clients/:id/rss/fetch", async (req, res) => {
 
     const items = await rssLib.fetchFeeds(feeds, 20);
     const { data: existing } = await supabase.from("calendar_items")
-      .select("link, topic").eq("client_id", client.id);
-    const haveLinks = new Set((existing || []).map(e => normLink(e.link)).filter(Boolean));
-    const haveTitles = new Set((existing || []).map(e => normTitle(e.topic)).filter(Boolean));
-    const fresh = items.filter(i => !haveLinks.has(normLink(i.link)) && !haveTitles.has(normTitle(i.title)));
+      .select("link").eq("client_id", client.id).not("link", "is", null);
+    const have = new Set((existing || []).map(e => e.link));
+    const fresh = items.filter(i => !have.has(i.link));
 
     let inserted = [];
     if (fresh.length) {
@@ -576,15 +563,15 @@ async function runRssScheduler() {
     try {
       const items = await rssLib.fetchFeeds(feeds, 20);
       const { data: existing } = await supabase.from("calendar_items")
-        .select("link, topic").eq("client_id", client.id);
-      const haveLinks = new Set((existing || []).map(e => normLink(e.link)).filter(Boolean));
-      const haveTitles = new Set((existing || []).map(e => normTitle(e.topic)).filter(Boolean));
-      const fresh = items
-        .filter(i => !haveLinks.has(normLink(i.link)) && !haveTitles.has(normTitle(i.title)))
-        .slice(0, client.rss_daily_limit || 3);
+        .select("link").eq("client_id", client.id).not("link", "is", null);
+      const have = new Set((existing || []).map(e => e.link));
+      const fresh = items.filter(i => !have.has(i.link));
+      // No cap by default (each client = separate Flow account). Optional ceiling.
+      const toGen = (client.rss_daily_limit && client.rss_daily_limit > 0)
+        ? fresh.slice(0, client.rss_daily_limit) : fresh;
 
-      console.log(`📰 RSS [${client.name}] ${fresh.length} new article(s) to generate`);
-      for (const it of fresh) {
+      console.log(`📰 RSS [${client.name}] ${toGen.length} new article(s) to generate`);
+      for (const it of toGen) {
         const { data: ci } = await supabase.from("calendar_items").insert({
           client_id: client.id, topic: it.title, hook: it.summary, link: it.link,
           source: "rss", scheduled_date: today, status: "generating"
@@ -606,10 +593,52 @@ async function runRssScheduler() {
   }
 }
 
-// check hourly; also once ~30s after startup (disabled in free-plan mode — the worker does it)
+// ── Local worker loop (only when RUN_JOBS !== "false") ──────────────
+// Picks up dashboard-queued videos AND runs the daily RSS scheduler.
+// On Render (RUN_JOBS=false) none of this runs — it only queues to the DB.
+async function processQueuedVideos() {
+  try {
+    const { data: queued } = await supabase.from("videos")
+      .select("*").eq("status", "queued").order("created_at").limit(50);
+    if (!queued?.length) return;
+    console.log(`📥 ${queued.length} queued video(s) to generate`);
+
+    for (const v of queued) {
+      await waitUntilFree();
+      const { data: client } = await supabase.from("clients").select("*").eq("id", v.client_id).single();
+      if (!client?.cookies) {
+        console.log(`Skipping ${v.id} — client has no cookies`);
+        await supabase.from("videos").update({ status: "error", error: "no cookies" }).eq("id", v.id);
+        continue;
+      }
+      // mark generating so other instances don't grab it
+      await supabase.from("videos").update({ status: "generating" }).eq("id", v.id);
+
+      const cookiesPath = path.join(__dirname, "uploads", `cookies_${uuidv4()}.json`);
+      fs.writeFileSync(cookiesPath, JSON.stringify(client.cookies));
+      let imagePath = null;
+      if (client.reference_image_path) {
+        const ref = path.join(__dirname, "assets", client.reference_image_path);
+        if (fs.existsSync(ref)) imagePath = ref;
+      }
+      const jobId = uuidv4();
+      jobs.set(jobId, { logs: [], ws: null });
+      await new Promise(resolve => {
+        runPipeline({ jobId, client, cookiesPath, imagePath, prompt: v.prompt, videoRow: v, topic: v.title, onComplete: resolve });
+      });
+    }
+  } catch (e) { console.log("Queue poller error:", e.message); }
+}
+
 if (process.env.RUN_JOBS !== "false") {
+  // hourly RSS + queue poll every 30s; both also fire shortly after startup
   setInterval(() => runRssScheduler().catch(e => console.log("RSS scheduler:", e.message)), 60 * 60 * 1000);
   setTimeout(() => runRssScheduler().catch(() => {}), 30 * 1000);
+  setInterval(() => processQueuedVideos().catch(e => console.log("Queue poll:", e.message)), 30 * 1000);
+  setTimeout(() => processQueuedVideos().catch(() => {}), 10 * 1000);
+  console.log("⚙️  Generation ENABLED (RUN_JOBS=true) — this instance generates videos");
+} else {
+  console.log("🌐 Dashboard-only mode (RUN_JOBS=false) — jobs are queued for the local worker");
 }
 
 // ====================================================================
