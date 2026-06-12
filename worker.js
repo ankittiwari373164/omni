@@ -136,6 +136,7 @@ async function processVideo({ client, videoRow, prompt, topic }) {
         cookies: client.cookies,
         prompt: String(prompt).replace(/\s*\n+\s*/g, " ").trim(),
         imagePath, aspectRatio: "portrait", duration: 8,
+        proxy: client.proxy || null,
         outDir: path.join(__dirname, "outputs"),
         baseName: `flow_${jobId}`, onLog: (m) => log(m)
       });
