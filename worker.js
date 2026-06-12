@@ -32,7 +32,9 @@ const veoLib     = (() => { try { return require("./lib/veo"); } catch { return 
 
 ["uploads", "outputs", "assets"].forEach(d => fs.mkdirSync(path.join(__dirname, d), { recursive: true }));
 
-const MAX_VIDEOS_PER_RUN = parseInt(process.env.WORKER_MAX_VIDEOS || "4", 10);
+// No global cap — each client uses a separate Flow account, so generations
+// don't share a quota. A safety ceiling avoids runaway loops only.
+const MAX_VIDEOS_PER_RUN = parseInt(process.env.WORKER_MAX_VIDEOS || "1000", 10);
 let processed = 0;
 
 const log = (m) => console.log(`[worker] ${m}`);
@@ -82,9 +84,15 @@ async function processVideo({ client, videoRow, prompt, topic }) {
   log(`🚀 ${client.name} — "${(topic || prompt).slice(0, 70)}"`);
   await supabase.from("videos").update({ status: "generating" }).eq("id", videoRow.id);
 
-  // pull this client's assets from Supabase Storage (runner disk is empty)
-  const imagePath = client.reference_image_path ? await assetsLib.fetchAsset(client.reference_image_path) : null;
-  if (client.reference_image_path && !imagePath) log("⚠️  reference image not in Supabase Storage — generating without it");
+  // Reference image is OPTIONAL — only used if the client has one configured.
+  let imagePath = null;
+  if (client.reference_image_path) {
+    imagePath = await assetsLib.fetchAsset(client.reference_image_path).catch(() => null);
+    if (imagePath) log("📎 Using client reference image");
+    else log("⚠️  reference image configured but not found in storage — generating without it");
+  } else {
+    log("ℹ️  No reference image for this client — generating text-only");
+  }
 
   let rawVideoFile = null;
 
@@ -234,6 +242,51 @@ async function processQueue() {
   }
 }
 
+// ── 1.5) calendar-due auto-generate ─────────────────────────────────
+// Generates any calendar item scheduled for today (or earlier) that is
+// still pending. This lets the dashboard calendar drive generation:
+// schedule a topic for a date, and the worker makes it on that day.
+async function processCalendarDue() {
+  const today = new Date().toISOString().slice(0, 10);
+  const { data: due } = await supabase.from("calendar_items")
+    .select("*")
+    .lte("scheduled_date", today)
+    .in("status", ["pending", "scheduled", "planned"])
+    .order("scheduled_date");
+
+  if (!due?.length) { log("No calendar items due."); return; }
+  log(`📅 ${due.length} calendar item(s) due.`);
+
+  for (const ci of due) {
+    if (processed >= MAX_VIDEOS_PER_RUN) { log("Safety ceiling reached; rest stays for next run."); return; }
+    const { data: client } = await supabase.from("clients").select("*").eq("id", ci.client_id).single();
+    if (!client) { log(`Skipping calendar item ${ci.id} — client not found`); continue; }
+    if (!client.cookies && !process.env.GEMINI_API_KEY && !process.env.CAPTCHA_API_KEY) {
+      log(`Skipping ${client.name} calendar item — no auth configured`); continue;
+    }
+
+    // Build a prompt if the calendar item doesn't already have one
+    let prompt = ci.prompt;
+    if (!prompt) {
+      prompt = await groqLib.generateNewsPrompt({
+        businessName: client.name, businessDetails: client.business_details,
+        title: ci.topic, summary: ci.hook || ""
+      }).catch(() => ci.topic);
+      await supabase.from("calendar_items").update({ prompt }).eq("id", ci.id);
+    }
+
+    await supabase.from("calendar_items").update({ status: "generating" }).eq("id", ci.id);
+
+    const { data: videoRow } = await supabase.from("videos").insert({
+      client_id: client.id, calendar_item_id: ci.id, prompt,
+      title: ci.topic, status: "generating"
+    }).select().single();
+
+    await processVideo({ client, videoRow, prompt, topic: ci.topic });
+    processed++;
+  }
+}
+
 // ── 2) RSS daily auto-generate (single-run port of runRssScheduler) ──
 function clientFeeds(client) {
   const cats = String(client.rss_categories || "").split(",").map(s => s.trim()).filter(Boolean);
@@ -269,11 +322,14 @@ async function runRssOnce() {
       const haveLinks = new Set((existing || []).map(e => normLink(e.link)).filter(Boolean));
       const haveTitles = new Set((existing || []).map(e => normTitle(e.topic)).filter(Boolean));
       const fresh = items
-        .filter(i => !haveLinks.has(normLink(i.link)) && !haveTitles.has(normTitle(i.title)))
-        .slice(0, client.rss_daily_limit || 3);
-      log(`📰 RSS [${client.name}] ${fresh.length} new article(s)`);
+        .filter(i => !haveLinks.has(normLink(i.link)) && !haveTitles.has(normTitle(i.title)));
+      // No per-day cap — different account per client. Optional ceiling via rss_daily_limit if set >0.
+      const capped = (client.rss_daily_limit && client.rss_daily_limit > 0)
+        ? fresh.slice(0, client.rss_daily_limit)
+        : fresh;
+      log(`📰 RSS [${client.name}] ${capped.length} new article(s) from categories: ${client.rss_categories || "custom feeds"}`);
 
-      for (const it of fresh) {
+      for (const it of capped) {
         if (processed >= MAX_VIDEOS_PER_RUN) return;
         const { data: ci } = await supabase.from("calendar_items").insert({
           client_id: client.id, topic: it.title, hook: it.summary, link: it.link,
@@ -300,9 +356,10 @@ async function runRssOnce() {
 }
 
 (async () => {
-  log(`Run started (max ${MAX_VIDEOS_PER_RUN} videos/run)`);
-  await processQueue();
-  await runRssOnce();
+  log(`Run started (ceiling ${MAX_VIDEOS_PER_RUN} videos/run)`);
+  await processQueue();        // 1) dashboard-queued videos
+  await processCalendarDue();  // 1.5) calendar items due today
+  await runRssOnce();          // 2) daily RSS by category
   log(`Run finished — ${processed} video(s) processed.`);
   process.exit(0);
 })().catch(e => { console.error(e); process.exit(1); });

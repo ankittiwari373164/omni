@@ -294,12 +294,6 @@ function renderConfig(){
           <div class="upload-zone"><input type="file" id="outroFile" accept="video/*"><div>🎞️ Outro video</div>
             <div class="upload-name" id="outroName">${c.outro_path?'✓ '+esc(c.outro_path):''}</div></div></div>
       </div>
-      <div class="field"><label>Fixed reference image (auto-used for every generation)</label>
-        <div class="upload-zone"><input type="file" id="refFile" accept="image/*"><div>🧷 Reference image</div>
-          <div class="upload-name" id="refName">${c.reference_image_path?'✓ '+esc(c.reference_image_path):''}</div></div>
-        <div class="hint">When set, this image is sent with every prompt — no need to upload it each time. (A per-generation upload still overrides it.)</div>
-        ${c.reference_image_path?`<img src="/assets/${esc(c.reference_image_path)}" style="max-height:120px;border-radius:8px;margin-top:8px;border:1px solid var(--border2)">`:''}
-      </div>
     </div>
 
     <div class="card">
@@ -320,7 +314,7 @@ function renderConfig(){
     </div>`;
 
   bindName("cookieFile","cookieName"); bindName("frameFile","frameName");
-  bindName("outroFile","outroName"); bindName("refFile","refName");
+  bindName("outroFile","outroName");
   loadStyles(c.prompt_style||"default");
   loadCategories((c.rss_categories||"").split(",").map(s=>s.trim()).filter(Boolean));
 }
@@ -418,7 +412,6 @@ async function saveConfig(){
     fd.append("rss_categories", cats);
     if($("frameFile").files[0]) fd.append("frame", $("frameFile").files[0]);
     if($("outroFile").files[0]) fd.append("outro", $("outroFile").files[0]);
-    if($("refFile").files[0]) fd.append("reference_image", $("refFile").files[0]);
     const cf = $("cookieFile").files[0];
     if(cf){ fd.append("cookies", await cf.text()); }
     currentClient = await api("/api/clients/"+currentClient.id+"/config",{method:"POST",body:fd});
@@ -528,9 +521,6 @@ function renderGenerate(){
           <input type="hidden" id="genTopic">
           <div class="field"><label>Script / prompt (scene-cut; leave blank to auto-generate from a calendar item)</label>
             <textarea id="genPrompt" style="min-height:160px" placeholder="A 10-second cinematic vertical 9:16 video.&#10;Scene 1 (0-2 sec): …&#10;Scene 2 (2-4 sec): …&#10;Voiceover (off-screen): &quot;…&quot;&#10;Style: …"></textarea></div>
-          <div class="field"><label>Reference image (optional — overrides the client's fixed one)</label>
-            <div class="upload-zone"><input type="file" id="genImage" accept="image/*"><div>🖼️ Reference image</div>
-              <div class="upload-name" id="genImageName">${currentClient && currentClient.reference_image_path ? 'Using fixed: '+esc(currentClient.reference_image_path) : ''}</div></div></div>
           <button class="btn btn-primary" id="genBtn" onclick="startGenerate()">Generate Video</button>
           <div class="hint">Always renders 10s · Omni · 9:16, then applies the frame + outro and uploads per config.</div>
         </div>
@@ -541,7 +531,6 @@ function renderGenerate(){
         <div class="log-body" id="genLog"><div class="hint">Logs will stream here.</div></div>
       </div>
     </div>`;
-  bindName("genImage","genImageName");
 }
 function addLog(type,msg,ts){
   const body=$("genLog"); const h=body.querySelector(".hint"); if(h) h.remove();
@@ -558,7 +547,7 @@ async function startGenerate(){
     const p=$("genPrompt").value.trim(); if(p) fd.append("prompt",p);
     const ci=$("genCalItem").value; if(ci) fd.append("calendar_item_id",ci);
     const tp=$("genTopic").value.trim(); if(tp) fd.append("topic",tp);
-    if($("genImage").files[0]) fd.append("image",$("genImage").files[0]);
+    // reference image removed from UI — generation is text-only (or uses backend default if any)
     const {jobId}=await api("/api/clients/"+currentClient.id+"/generate",{method:"POST",body:fd});
     connectWS(jobId);
   }catch(e){ addLog("error",e.message); toast("Error: "+e.message); btn.disabled=false; btn.textContent="Generate Video"; }
