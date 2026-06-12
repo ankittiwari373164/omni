@@ -118,9 +118,17 @@ async function processVideo({ client, videoRow, prompt, topic }) {
   }
 
   if (!rawVideoFile) {
-    // Fallback: Flow browser automation (often flagged on datacenter IPs)
+    // Block browser fallback when CAPTCHA_API_KEY is set — Chromium not installed
+    if (process.env.CAPTCHA_API_KEY) {
+      log("❌ Direct Flow API failed — check the error above. Browser fallback skipped (Chromium not installed in this workflow).");
+      await supabase.from("videos").update({ status: "error", error: "flow-api failed" }).eq("id", videoRow.id);
+      if (videoRow.calendar_item_id)
+        await supabase.from("calendar_items").update({ status: "error" }).eq("id", videoRow.calendar_item_id);
+      return false;
+    }
+    // Fallback: Flow browser automation (only when no captcha key)
     if (!client.cookies) {
-      log("❌ Veo failed and no Flow cookies available — cannot generate");
+      log("❌ No cookies and no captcha key — cannot generate");
       await supabase.from("videos").update({ status: "error", error: "generation failed (no fallback)" }).eq("id", videoRow.id);
       if (videoRow.calendar_item_id)
         await supabase.from("calendar_items").update({ status: "error" }).eq("id", videoRow.calendar_item_id);
