@@ -48,6 +48,43 @@ function applyTpl(tpl, vars) {
 // Parse a proxy URL like "http://user:pass@host:port" or "socks5://host:port"
 // into the PROXY_SERVER / PROXY_USERNAME / PROXY_PASSWORD vars that flow.js reads.
 // Returns {} when no proxy is given so the global PROXY_SERVER secret (if any) is used.
+// Hide credentials when logging a proxy URL.
+function maskProxy(url) {
+  try { const u = new URL(url); return `${u.protocol}//${u.host}`; }
+  catch { return String(url).replace(/:[^:@/]+@/, ":***@"); }
+}
+
+// Build an ordered, de-duplicated list of proxy URLs to rotate through.
+// Sources: the client's own proxy, then PROXY_POOL (comma/newline separated),
+// then the single PROXY_SERVER fallback. Bare "host:port" entries get the
+// http:// scheme and inherit PROXY_USERNAME / PROXY_PASSWORD.
+function buildProxyPool(clientProxy) {
+  const user = process.env.PROXY_USERNAME || "";
+  const pass = process.env.PROXY_PASSWORD || "";
+  const norm = (raw) => {
+    let s = String(raw || "").trim();
+    if (!s) return null;
+    if (!/^\w+:\/\//.test(s)) s = "http://" + s;          // add scheme if missing
+    try {
+      const u = new URL(s);
+      if (!u.username && user) { u.username = user; u.password = pass; } // inherit creds
+      return u.toString();
+    } catch { return null; }
+  };
+  const raw = [
+    clientProxy,
+    ...String(process.env.PROXY_POOL || "").split(/[\n,]+/),
+    process.env.PROXY_SERVER,
+  ];
+  const seen = new Set();
+  const out = [];
+  for (const r of raw) {
+    const n = norm(r);
+    if (n && !seen.has(n)) { seen.add(n); out.push(n); }
+  }
+  return out;
+}
+
 function proxyEnvFromUrl(proxyUrl) {
   if (!proxyUrl || typeof proxyUrl !== "string" || !proxyUrl.trim()) return {};
   try {
@@ -130,17 +167,37 @@ async function processVideo({ client, videoRow, prompt, topic }) {
 
   } else if (process.env.CAPTCHA_API_KEY) {
     // Path 2: Direct Flow API + captcha solving (no browser, uses Omni Flash credits)
-    try {
-      log(`🔑 Using direct Flow API with captcha solving (${process.env.CAPTCHA_SERVICE || "anticaptcha"})`);
-      rawVideoFile = await flowApiLib.generateVideo({
-        cookies: client.cookies,
-        prompt: String(prompt).replace(/\s*\n+\s*/g, " ").trim(),
-        imagePath, aspectRatio: "portrait", duration: 8,
-        proxy: client.proxy || null,
-        outDir: path.join(__dirname, "outputs"),
-        baseName: `flow_${jobId}`, onLog: (m) => log(m)
-      });
-    } catch (e) { log(`Flow direct API failed: ${e.message}`); }
+    log(`🔑 Using direct Flow API with captcha solving (${process.env.CAPTCHA_SERVICE || "anticaptcha"})`);
+
+    // Build a proxy pool to rotate through on "unusual activity" blocks.
+    // Order of preference: this client's own proxy, then PROXY_POOL entries,
+    // then the single PROXY_SERVER fallback. host:port entries inherit the
+    // global PROXY_USERNAME / PROXY_PASSWORD; full URLs are used as-is.
+    const pool = buildProxyPool(client.proxy);
+    if (pool.length) log(`🔁 Proxy pool: ${pool.length} IP(s) to try`);
+    // Always have at least one attempt (null = no proxy / inherit env).
+    const attempts = pool.length ? pool : [null];
+
+    for (let i = 0; i < attempts.length; i++) {
+      const px = attempts[i];
+      try {
+        if (px) log(`➡️  Attempt ${i + 1}/${attempts.length} via ${maskProxy(px)}`);
+        rawVideoFile = await flowApiLib.generateVideo({
+          cookies: client.cookies,
+          prompt: String(prompt).replace(/\s*\n+\s*/g, " ").trim(),
+          imagePath, aspectRatio: "portrait", duration: 8,
+          proxy: px,
+          outDir: path.join(__dirname, "outputs"),
+          baseName: `flow_${jobId}`, onLog: (m) => log(m)
+        });
+        if (rawVideoFile) break;                 // success — stop rotating
+      } catch (e) {
+        const blocked = /unusual activity|blocked|403|429|permission denied|resource exhausted/i.test(e.message);
+        log(`Flow attempt ${i + 1} failed: ${e.message}`);
+        if (blocked && i < attempts.length - 1) { log("🔄 Rotating to next proxy…"); continue; }
+        if (i >= attempts.length - 1) log("No more proxies to try.");
+      }
+    }
 
   } else {
     // Path 3: Browser automation (Playwright) — fallback, often flagged on CI
