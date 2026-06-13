@@ -11,6 +11,7 @@ const path = require("path");
 const { spawn } = require("child_process");
 
 const supabase = require("./lib/supabase");
+const assetsSync = require("./lib/assets-sync");
 const groqLib = require("./lib/groq");
 const videoLib = require("./lib/video");
 const googleLib = require("./lib/google");
@@ -145,8 +146,14 @@ app.post("/api/clients/:id/config", upload.fields([
     try { patch.cookies = JSON.parse(b.cookies); }
     catch { return res.status(400).json({ error: "cookies must be valid JSON" }); }
   }
-  if (req.files?.frame?.[0]) patch.frame_path = saveAsset(req.files.frame[0], `frame_${req.params.id}`);
-  if (req.files?.outro?.[0]) patch.outro_path = saveAsset(req.files.outro[0], `outro_${req.params.id}`);
+  if (req.files?.frame?.[0]) {
+    patch.frame_path = saveAsset(req.files.frame[0], `frame_${req.params.id}`);
+    await assetsSync.uploadAsset(path.join(__dirname, "assets", patch.frame_path), patch.frame_path);
+  }
+  if (req.files?.outro?.[0]) {
+    patch.outro_path = saveAsset(req.files.outro[0], `outro_${req.params.id}`);
+    await assetsSync.uploadAsset(path.join(__dirname, "assets", patch.outro_path), patch.outro_path);
+  }
   if (req.files?.reference_image?.[0]) {
     // store with original extension so Flow accepts the format
     const f = req.files.reference_image[0];
@@ -154,6 +161,7 @@ app.post("/api/clients/:id/config", upload.fields([
     const name = `ref_${req.params.id}_${Date.now()}${ext}`;
     fs.renameSync(f.path, path.join(__dirname, "assets", name));
     patch.reference_image_path = name;
+    await assetsSync.uploadAsset(path.join(__dirname, "assets", name), name);
   }
 
   const { data, error } = await supabase.from("clients").update(patch).eq("id", req.params.id).select().single();
@@ -246,6 +254,14 @@ app.post("/api/clients/:id/generate", upload.fields([{ name: "image", maxCount: 
     const { data: client } = await supabase.from("clients").select("*").eq("id", req.params.id).single();
     if (!client) return res.status(404).json({ error: "client not found" });
     if (!client.cookies) return res.status(400).json({ error: "client has no cookies configured" });
+
+    // Make sure this client's assets (reference image, frame, outro) exist on
+    // THIS machine's local assets/ folder — download any missing ones from
+    // Supabase Storage. This is what lets you upload assets on the Render
+    // dashboard and have them appear here on the local generator.
+    if (process.env.DASHBOARD_ONLY !== "1") {
+      await assetsSync.ensureLocalAssets(client, path.join(__dirname, "assets"));
+    }
 
     let prompt = req.body.prompt;
     const calItemId = req.body.calendar_item_id || null;
@@ -488,16 +504,19 @@ function generateOne({ client, prompt, topic, calItemId, link }) {
   const cookiesPath = path.join(__dirname, "uploads", `cookies_${uuidv4()}.json`);
   fs.writeFileSync(cookiesPath, JSON.stringify(client.cookies));
 
-  let imagePath = null;
-  if (client.reference_image_path) {
-    const ref = path.join(__dirname, "assets", client.reference_image_path);
-    if (fs.existsSync(ref)) imagePath = ref;
-  }
-
   const jobId = uuidv4();
   jobs.set(jobId, { logs: [], ws: null });
 
   return (async () => {
+    // sync this client's assets to local disk first (no-op if already present)
+    await assetsSync.ensureLocalAssets(client, path.join(__dirname, "assets"));
+
+    let imagePath = null;
+    if (client.reference_image_path) {
+      const ref = path.join(__dirname, "assets", client.reference_image_path);
+      if (fs.existsSync(ref)) imagePath = ref;
+    }
+
     const { data: videoRow } = await supabase.from("videos").insert({
       client_id: client.id, calendar_item_id: calItemId || null, prompt,
       title: topic || client.name, status: "generating"
