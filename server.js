@@ -290,18 +290,6 @@ app.post("/api/clients/:id/generate", upload.fields([{ name: "image", maxCount: 
     const jobId = uuidv4();
     jobs.set(jobId, { logs: [], ws: null });
 
-    // When generation is disabled (e.g. on Render), queue the job for the
-    // local worker instance to pick up instead of running Playwright here.
-    if (process.env.RUN_JOBS === "false") {
-      const { data: videoRow } = await supabase.from("videos").insert({
-        client_id: client.id, calendar_item_id: calItemId, prompt,
-        title: topic || client.name, status: "queued"
-      }).select().single();
-      if (calItemId) await supabase.from("calendar_items").update({ status: "queued" }).eq("id", calItemId);
-      try { fs.unlinkSync(cookiesPath); } catch {}
-      return res.json({ jobId, videoId: videoRow.id, queued: true });
-    }
-
     // create the video DB row (pending)
     const { data: videoRow } = await supabase.from("videos").insert({
       client_id: client.id, calendar_item_id: calItemId, prompt,
@@ -565,13 +553,10 @@ async function runRssScheduler() {
       const { data: existing } = await supabase.from("calendar_items")
         .select("link").eq("client_id", client.id).not("link", "is", null);
       const have = new Set((existing || []).map(e => e.link));
-      const fresh = items.filter(i => !have.has(i.link));
-      // No cap by default (each client = separate Flow account). Optional ceiling.
-      const toGen = (client.rss_daily_limit && client.rss_daily_limit > 0)
-        ? fresh.slice(0, client.rss_daily_limit) : fresh;
+      const fresh = items.filter(i => !have.has(i.link)).slice(0, client.rss_daily_limit || 3);
 
-      console.log(`📰 RSS [${client.name}] ${toGen.length} new article(s) to generate`);
-      for (const it of toGen) {
+      console.log(`📰 RSS [${client.name}] ${fresh.length} new article(s) to generate`);
+      for (const it of fresh) {
         const { data: ci } = await supabase.from("calendar_items").insert({
           client_id: client.id, topic: it.title, hook: it.summary, link: it.link,
           source: "rss", scheduled_date: today, status: "generating"
@@ -593,53 +578,9 @@ async function runRssScheduler() {
   }
 }
 
-// ── Local worker loop (only when RUN_JOBS !== "false") ──────────────
-// Picks up dashboard-queued videos AND runs the daily RSS scheduler.
-// On Render (RUN_JOBS=false) none of this runs — it only queues to the DB.
-async function processQueuedVideos() {
-  try {
-    const { data: queued } = await supabase.from("videos")
-      .select("*").eq("status", "queued").order("created_at").limit(50);
-    if (!queued?.length) return;
-    console.log(`📥 ${queued.length} queued video(s) to generate`);
-
-    for (const v of queued) {
-      await waitUntilFree();
-      const { data: client } = await supabase.from("clients").select("*").eq("id", v.client_id).single();
-      if (!client?.cookies) {
-        console.log(`Skipping ${v.id} — client has no cookies`);
-        await supabase.from("videos").update({ status: "error", error: "no cookies" }).eq("id", v.id);
-        continue;
-      }
-      // mark generating so other instances don't grab it
-      await supabase.from("videos").update({ status: "generating" }).eq("id", v.id);
-
-      const cookiesPath = path.join(__dirname, "uploads", `cookies_${uuidv4()}.json`);
-      fs.writeFileSync(cookiesPath, JSON.stringify(client.cookies));
-      let imagePath = null;
-      if (client.reference_image_path) {
-        const ref = path.join(__dirname, "assets", client.reference_image_path);
-        if (fs.existsSync(ref)) imagePath = ref;
-      }
-      const jobId = uuidv4();
-      jobs.set(jobId, { logs: [], ws: null });
-      await new Promise(resolve => {
-        runPipeline({ jobId, client, cookiesPath, imagePath, prompt: v.prompt, videoRow: v, topic: v.title, onComplete: resolve });
-      });
-    }
-  } catch (e) { console.log("Queue poller error:", e.message); }
-}
-
-if (process.env.RUN_JOBS !== "false") {
-  // hourly RSS + queue poll every 30s; both also fire shortly after startup
-  setInterval(() => runRssScheduler().catch(e => console.log("RSS scheduler:", e.message)), 60 * 60 * 1000);
-  setTimeout(() => runRssScheduler().catch(() => {}), 30 * 1000);
-  setInterval(() => processQueuedVideos().catch(e => console.log("Queue poll:", e.message)), 30 * 1000);
-  setTimeout(() => processQueuedVideos().catch(() => {}), 10 * 1000);
-  console.log("⚙️  Generation ENABLED (RUN_JOBS=true) — this instance generates videos");
-} else {
-  console.log("🌐 Dashboard-only mode (RUN_JOBS=false) — jobs are queued for the local worker");
-}
+// check hourly; also once ~30s after startup
+setInterval(() => runRssScheduler().catch(e => console.log("RSS scheduler:", e.message)), 60 * 60 * 1000);
+setTimeout(() => runRssScheduler().catch(() => {}), 30 * 1000);
 
 // ====================================================================
 //  YOUTUBE settings (per client) — official API only
