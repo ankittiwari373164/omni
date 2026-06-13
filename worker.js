@@ -222,8 +222,20 @@ async function processVideo({ client, videoRow, prompt, topic }) {
       return false;
     }
     log(process.env.GEMINI_API_KEY ? "Falling back to Flow browser automation…" : "GEMINI_API_KEY not set — using Flow browser automation");
-    const flowRes = await runFlow({ client, prompt, jobId, imagePath, proxyUrl: client.proxy || null });
-    rawVideoFile = flowRes.rawVideoFile;
+
+    // Rotate through the proxy pool: a slow/dead/flagged IP on one attempt
+    // falls through to the next instead of failing the whole job.
+    const pool = buildProxyPool(client.proxy);
+    const attempts = pool.length ? pool : [null];
+    if (pool.length) log(`🔁 Proxy pool: ${pool.length} IP(s) to try`);
+    for (let i = 0; i < attempts.length; i++) {
+      const px = attempts[i];
+      if (px) log(`➡️  Attempt ${i + 1}/${attempts.length} via ${maskProxy(px)}`);
+      const flowRes = await runFlow({ client, prompt, jobId, imagePath, proxyUrl: px });
+      rawVideoFile = flowRes.rawVideoFile;
+      if (rawVideoFile) break;
+      if (i < attempts.length - 1) log("🔄 Rotating to next proxy…");
+    }
     if (!rawVideoFile) {
       log(`❌ Generation failed on all paths`);
       await supabase.from("videos").update({ status: "error", error: "generation failed" }).eq("id", videoRow.id);
