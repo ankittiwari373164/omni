@@ -45,7 +45,9 @@ jobs:
       - run: npm ci
 
       - name: Install Chromium for token generation
-        run: npx playwright install --with-deps chromium
+        run: |
+          npx playwright install --with-deps chromium
+          npx playwright install chrome || echo "::warning::Real Chrome install failed — will fall back to Chromium"
 
       # ── VPN (optional, fail-soft) ──────────────────────────────────────
       # Gives the runner a fresh / Indian exit IP so Google Flow stops
@@ -72,8 +74,16 @@ jobs:
               exit 0
             fi
             echo "Installing Windscribe CLI…"
-            curl -fsSL https://repo.windscribe.com/install/keys/release.asc \
-              | sudo gpg --dearmor -o /usr/share/keyrings/windscribe.gpg
+            # repo.windscribe.com sometimes fails to resolve on CI — retry a few times.
+            key_ok=""
+            for i in 1 2 3; do
+              if curl -fsSL --max-time 20 https://repo.windscribe.com/install/keys/release.asc \
+                   | sudo gpg --dearmor -o /usr/share/keyrings/windscribe.gpg; then key_ok=1; break; fi
+              echo "key fetch attempt $i failed, retrying…"; sleep 5
+            done
+            if [ -z "$key_ok" ]; then
+              echo "::warning::Could not reach repo.windscribe.com from the runner — skipping VPN. Use a per-account proxy instead (see notes)."; exit 0
+            fi
             echo "deb [arch=amd64 signed-by=/usr/share/keyrings/windscribe.gpg] https://repo.windscribe.com/ubuntu bionic main" \
               | sudo tee /etc/apt/sources.list.d/windscribe-repo.list >/dev/null
             sudo apt-get update -qq && sudo apt-get install -y -qq windscribe-cli || {
