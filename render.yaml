@@ -24,6 +24,10 @@ services:
       # browser is never used on Render).
       - key: PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD
         value: "1"
+      # Render is dashboard-only: queue jobs to Supabase, never launch a browser
+      # here (datacenter IP = Flow "unusual activity"). Local poller does the work.
+      - key: DASHBOARD_ONLY
+        value: "1"
       - key: NODE_VERSION
         value: "22"
       - key: PORT

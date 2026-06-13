@@ -291,6 +291,28 @@ app.post("/api/clients/:id/generate", upload.fields([{ name: "image", maxCount: 
     jobs.set(jobId, { logs: [], ws: null });
 
     // create the video DB row (pending)
+    // DASHBOARD_ONLY (set on Render): never launch a browser here — datacenter
+    // IPs get flagged by Flow. Instead, queue the job: create a calendar item
+    // the local poller will pick up and generate on the real-IP machine.
+    if (process.env.DASHBOARD_ONLY === "1") {
+      const today = new Date().toISOString().slice(0, 10);
+      let queuedItemId = calItemId;
+      if (!queuedItemId) {
+        const { data: ci } = await supabase.from("calendar_items").insert({
+          client_id: client.id, topic: topic || client.name, prompt,
+          source: "manual", scheduled_date: today, status: "prompt_ready"
+        }).select().single();
+        queuedItemId = ci?.id;
+      } else {
+        // ensure it's pickable by the poller (planned/prompt_ready)
+        await supabase.from("calendar_items").update({ status: "prompt_ready", prompt }).eq("id", queuedItemId);
+      }
+      // remove the premature video row + temp cookie file we created above
+      try { fs.existsSync(cookiesPath) && fs.unlinkSync(cookiesPath); } catch {}
+      return res.json({ queued: true, calendar_item_id: queuedItemId,
+        message: "Queued for your local PC. Make sure poller.js is running there." });
+    }
+
     const { data: videoRow } = await supabase.from("videos").insert({
       client_id: client.id, calendar_item_id: calItemId, prompt,
       title: topic || client.name, status: "generating"
@@ -567,6 +589,12 @@ async function runRssScheduler() {
           title: it.title, summary: it.summary
         });
         await supabase.from("calendar_items").update({ prompt }).eq("id", ci.id);
+
+        if (process.env.DASHBOARD_ONLY === "1") {
+          // Render: just queue it for the local poller; don't launch a browser.
+          await supabase.from("calendar_items").update({ status: "prompt_ready" }).eq("id", ci.id);
+          continue;
+        }
 
         await waitUntilFree();
         await generateOne({ client, prompt, topic: it.title, calItemId: ci.id, link: it.link });
