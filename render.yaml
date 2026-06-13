@@ -1,0 +1,50 @@
+# render.yaml — deploys ONLY the Flow Studio dashboard (server.js) on Render.
+#
+# IMPORTANT: the browser/Playwright generation does NOT run here. Render is a
+# datacenter and Google Flow blocks datacenter IPs. The actual video generation
+# runs on your LOCAL PC via poller.js. This service is just the web dashboard +
+# Supabase coordination, so we skip the Chromium download entirely.
+#
+# Put this file in your repo ROOT, commit, push. In Render: New → Blueprint →
+# pick this repo. Then fill the secret env vars in the dashboard.
+
+services:
+  - type: web
+    name: flow-studio
+    runtime: node                 # NOT docker — this was the build failure
+    plan: free
+    region: oregon                # change if you prefer (singapore is closer to IN)
+    branch: main
+    buildCommand: npm install     # installs deps only — no `playwright install`
+    startCommand: node server.js
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      # Skip downloading Chromium during npm install (saves build time; the
+      # browser is never used on Render).
+      - key: PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD
+        value: "1"
+      - key: NODE_VERSION
+        value: "20"
+      - key: PORT
+        value: "10000"            # Render injects PORT; server.js already reads process.env.PORT
+
+      # ---- Secrets: set these in the Render dashboard (Environment tab) ----
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: llama-3.3-70b-versatile
+      # Google OAuth (only if the dashboard uses Drive/YouTube features)
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        sync: false
+
+      # DO NOT set PROXY_*, CAPTCHA_*, or any browser/generation vars here —
+      # generation happens on your local PC, not on Render.
