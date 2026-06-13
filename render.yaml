@@ -25,7 +25,7 @@ services:
       - key: PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD
         value: "1"
       - key: NODE_VERSION
-        value: "20"
+        value: "22"
       - key: PORT
         value: "10000"            # Render injects PORT; server.js already reads process.env.PORT
 
