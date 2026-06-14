@@ -46,12 +46,34 @@ wss.on("connection", (ws, req) => {
 
 function sendLog(jobId, type, message) {
   const job = jobs.get(jobId);
-  if (!job) return;
   const entry = { type, message, ts: Date.now() };
-  job.logs.push(entry);
-  if (job.ws && job.ws.readyState === WebSocket.OPEN) job.ws.send(JSON.stringify(entry));
+  if (job) {
+    job.logs.push(entry);
+    if (job.ws && job.ws.readyState === WebSocket.OPEN) job.ws.send(JSON.stringify(entry));
+  }
   console.log(`[${jobId.slice(0, 6)}] ${message}`);
+  // Relay to Supabase so the Render dashboard (a different machine) can show
+  // logs from the local generator. Fire-and-forget; never blocks the pipeline.
+  supabase.from("job_logs").insert({
+    job_id: jobId,
+    client_id: job?.clientId || null,
+    type, message, ts: entry.ts
+  }).then(() => {}, () => {});
 }
+
+// Recent generation logs (read from Supabase) — lets ANY dashboard (Render or
+// local) show live logs from the local generator. Poll with ?since=<ts>.
+app.get("/api/logs", async (req, res) => {
+  try {
+    const since = Number(req.query.since || 0);
+    const clientId = req.query.client_id;
+    let q = supabase.from("job_logs").select("*").gt("ts", since).order("ts", { ascending: true }).limit(300);
+    if (clientId) q = q.eq("client_id", clientId);
+    const { data, error } = await q;
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data || []);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // helper: persist an uploaded file into assets/ with a stable name
 function saveAsset(file, prefix) {
@@ -324,7 +346,7 @@ app.post("/api/clients/:id/generate", upload.fields([{ name: "image", maxCount: 
     }
 
     const jobId = uuidv4();
-    jobs.set(jobId, { logs: [], ws: null });
+    jobs.set(jobId, { logs: [], ws: null, clientId: client.id });
 
     // create the video DB row (pending)
     // DASHBOARD_ONLY (set on Render): never launch a browser here — datacenter
@@ -566,7 +588,7 @@ function generateOne({ client, prompt, topic, calItemId, link }) {
   fs.writeFileSync(cookiesPath, JSON.stringify(client.cookies));
 
   const jobId = uuidv4();
-  jobs.set(jobId, { logs: [], ws: null });
+  jobs.set(jobId, { logs: [], ws: null, clientId: client.id });
 
   return (async () => {
     // sync this client's assets to local disk first (no-op if already present)
