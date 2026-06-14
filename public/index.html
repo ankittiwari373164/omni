@@ -556,6 +556,9 @@ function renderGenerate(){
       </div>
     </div>`;
   bindName("genImage","genImageName");
+  // Start streaming recent logs for this client (works on Render too — reads
+  // logs the local generator wrote to Supabase). Show the last ~3 min.
+  if(currentClient){ lastLogTs = Date.now() - 3*60*1000; seenLog.clear(); startLogPolling(currentClient.id); }
 }
 function addLog(type,msg,ts){
   const body=$("genLog"); const h=body.querySelector(".hint"); if(h) h.remove();
@@ -573,24 +576,32 @@ async function startGenerate(){
     const ci=$("genCalItem").value; if(ci) fd.append("calendar_item_id",ci);
     const tp=$("genTopic").value.trim(); if(tp) fd.append("topic",tp);
     if($("genImage").files[0]) fd.append("image",$("genImage").files[0]);
-    const {jobId}=await api("/api/clients/"+currentClient.id+"/generate",{method:"POST",body:fd});
-    connectWS(jobId);
+    lastLogTs = Date.now();           // only show logs from this point on
+    const {jobId,queued}=await api("/api/clients/"+currentClient.id+"/generate",{method:"POST",body:fd});
+    if(queued){ addLog("info","✓ Queued — will run on your PC. Logs will stream here."); }
+    startLogPolling(currentClient.id);
   }catch(e){ addLog("error",e.message); toast("Error: "+e.message); btn.disabled=false; btn.textContent="Generate Video"; }
 }
-function connectWS(jobId){
-  if(ws) ws.close();
-  const proto=location.protocol==="https:"?"wss":"ws";
-  ws=new WebSocket(`${proto}://${location.host}?jobId=${jobId}`);
-  ws.onmessage=(evt)=>{
-    const m=JSON.parse(evt.data);
-    if(m.type==="video"){ const v=$("genPreview"); v.src="/outputs/"+m.message; v.style.display="block"; return; }
-    addLog(m.type,m.message,m.ts);
-    if(m.message.includes("🏁")||m.type==="error"&&m.message.includes("failed")){
-      const b=$("genBtn"); if(b){b.disabled=false;b.textContent="Generate Video";}
-    }
-  };
-  ws.onerror=()=>addLog("error","WebSocket error");
+let logPoll=null, lastLogTs=0, seenLog=new Set();
+function startLogPolling(clientId){
+  stopLogPolling();
+  logPoll=setInterval(async()=>{
+    try{
+      const rows=await api(`/api/logs?client_id=${clientId}&since=${lastLogTs}`);
+      for(const r of rows){
+        const key=r.ts+"|"+r.message;
+        if(seenLog.has(key)) continue;
+        seenLog.add(key); if(r.ts>lastLogTs) lastLogTs=r.ts;
+        if(r.type==="video"){ const v=$("genPreview"); if(v){ v.src="/outputs/"+r.message; v.style.display="block"; } continue; }
+        addLog(r.type,r.message,r.ts);
+        if(r.message.includes("🏁")||(r.type==="error"&&r.message.includes("failed"))){
+          const b=$("genBtn"); if(b){b.disabled=false;b.textContent="Generate Video";}
+        }
+      }
+    }catch(e){}
+  },2000);
 }
+function stopLogPolling(){ if(logPoll){clearInterval(logPoll); logPoll=null;} }
 
 // ---------- VIDEOS ----------
 async function renderVideos(){
