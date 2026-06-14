@@ -443,6 +443,7 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
   generationBusy = true;
   (async () => {
     const outDir = path.join(__dirname, "outputs");
+    prompt = groqLib.sanitizePrompt(prompt);   // safety net for manual prompts too
     const parts = groqLib.splitPromptParts(prompt);
     const videoTitle = (topic && topic.trim()) || deriveTitle(prompt);
 
