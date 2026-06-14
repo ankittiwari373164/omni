@@ -129,6 +129,8 @@ app.post("/api/clients/:id/config", upload.fields([
   const b = req.body;
   if (b.name !== undefined) patch.name = b.name;
   if (b.business_details !== undefined) patch.business_details = b.business_details;
+  if (b.prompt_sample !== undefined) patch.prompt_sample = b.prompt_sample || null;
+  if (b.split_parts !== undefined) patch.split_parts = b.split_parts === "true" || b.split_parts === true;
   if (b.upload_to_drive !== undefined) patch.upload_to_drive = b.upload_to_drive === "true";
   if (b.drive_folder_id !== undefined) patch.drive_folder_id = b.drive_folder_id || null;
   if (b.upload_to_youtube !== undefined) patch.upload_to_youtube = b.upload_to_youtube === "true";
@@ -167,6 +169,22 @@ app.post("/api/clients/:id/config", upload.fields([
   const { data, error } = await supabase.from("clients").update(patch).eq("id", req.params.id).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
+});
+
+// Delete a client's reference image (clears DB path + removes local + storage copy)
+app.delete("/api/clients/:id/reference-image", async (req, res) => {
+  try {
+    const { data: client } = await supabase.from("clients").select("reference_image_path").eq("id", req.params.id).single();
+    const name = client?.reference_image_path;
+    if (name) {
+      try { fs.unlinkSync(path.join(__dirname, "assets", name)); } catch {}
+      try { await supabase.storage.from("assets").remove([name]); } catch {}
+    }
+    const { data, error } = await supabase.from("clients")
+      .update({ reference_image_path: null }).eq("id", req.params.id).select().single();
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.delete("/api/clients/:id", async (req, res) => {
@@ -222,7 +240,8 @@ app.post("/api/calendar/:itemId/prompt", async (req, res) => {
       : await groqLib.generatePrompt({
           businessName: client.name, businessDetails: client.business_details,
           topic: item.topic, hook: item.hook,
-          styleKey: client.prompt_style, styleInstruction: client.prompt_custom
+          styleKey: client.prompt_style, styleInstruction: client.prompt_custom,
+              promptSample: client.prompt_sample, splitParts: client.split_parts
         });
 
     const { data, error } = await supabase.from("calendar_items")
@@ -280,7 +299,8 @@ app.post("/api/clients/:id/generate", upload.fields([{ name: "image", maxCount: 
           : await groqLib.generatePrompt({
               businessName: client.name, businessDetails: client.business_details,
               topic: item.topic, hook: item.hook,
-              styleKey: client.prompt_style, styleInstruction: client.prompt_custom
+              styleKey: client.prompt_style, styleInstruction: client.prompt_custom,
+                  promptSample: client.prompt_sample, splitParts: client.split_parts
             });
         await supabase.from("calendar_items").update({ prompt, status: "prompt_ready" }).eq("id", calItemId);
       }
@@ -349,150 +369,191 @@ app.post("/api/clients/:id/generate", upload.fields([{ name: "image", maxCount: 
 // ====================================================================
 let generationBusy = false; // true while a Flow browser session is running
 
+// Derive a short human title from a prompt when no topic is set (manual prompts).
+function deriveTitle(prompt) {
+  const firstLine = String(prompt).split(/\n/).map(s => s.trim()).find(Boolean) || "video";
+  const clean = firstLine.replace(/^\*+|\*+$/g, "").replace(/[#*_`]/g, "").trim();
+  const words = clean.split(/\s+/).slice(0, 10).join(" ");
+  return (words || "video").slice(0, 80);
+}
+
+// Generate ONE clip for a single prompt part. Resolves to the raw filename or null.
+function generatePart({ jobId, partIndex, cookiesPath, imagePath, prompt }) {
+  return new Promise((resolve) => {
+    const partJob = `${jobId}_p${partIndex}`;
+    const scriptPath = path.join(__dirname, "uploads", `script_${partJob}.js`);
+    fs.writeFileSync(scriptPath, buildScript({
+      cookiesPath, imagePath,
+      prompt: String(prompt).replace(/\s*\n+\s*/g, " ").trim(),
+      aspectRatio: "9:16", speed: "1x", duration: "10s", jobId: partJob
+    }));
+
+    const proc = spawn("node", [scriptPath], {
+      cwd: __dirname,
+      env: { ...process.env, NODE_ENV: "production", NODE_PATH: path.join(__dirname, "node_modules") }
+    });
+    let rawVideoFile = null;
+
+    proc.stdout.on("data", (data) => {
+      data.toString().split("\n").filter(l => l.trim()).forEach(line => {
+        if (line.startsWith("__VIDEO__:")) { rawVideoFile = line.replace("__VIDEO__:", "").trim(); return; }
+        const type =
+          line.includes("❌") || line.toLowerCase().includes("failed") ? "error" :
+          line.includes("✅") ? "success" :
+          line.includes("→") || line.includes("Polling") ? "progress" : "info";
+        sendLog(jobId, type, line.replace(/\r/g, ""));
+      });
+    });
+    proc.stderr.on("data", (data) => {
+      data.toString().split("\n").filter(l => l.trim()).forEach(line => {
+        if (!line.includes("DeprecationWarning") && !line.includes("ExperimentalWarning"))
+          sendLog(jobId, "warn", line);
+      });
+    });
+    proc.on("close", () => {
+      try { fs.unlinkSync(scriptPath); } catch {}
+      resolve(rawVideoFile);
+    });
+  });
+}
+
 function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, topic, onComplete }) {
   generationBusy = true;
-  sendLog(jobId, "info", `🚀 Generating for ${client.name}`);
-  sendLog(jobId, "info", `📋 ${prompt.slice(0, 90)}${prompt.length > 90 ? "…" : ""}`);
+  (async () => {
+    const outDir = path.join(__dirname, "outputs");
+    const parts = groqLib.splitPromptParts(prompt);
+    const videoTitle = (topic && topic.trim()) || deriveTitle(prompt);
 
-  const scriptPath = path.join(__dirname, "uploads", `script_${jobId}.js`);
-  fs.writeFileSync(scriptPath, buildScript({
-    cookiesPath, imagePath,
-    prompt: String(prompt).replace(/\s*\n+\s*/g, " ").trim(),
-    aspectRatio: "9:16", speed: "1x", duration: "10s", jobId
-  }));
+    sendLog(jobId, "info", `🚀 Generating for ${client.name}`);
+    if (parts.length > 1) sendLog(jobId, "info", `🧩 Prompt split into ${parts.length} parts — will concatenate`);
+    sendLog(jobId, "info", `📋 ${prompt.slice(0, 90)}${prompt.length > 90 ? "…" : ""}`);
 
-  const proc = spawn("node", [scriptPath], {
-    cwd: __dirname,
-    env: { ...process.env, NODE_ENV: "production", NODE_PATH: path.join(__dirname, "node_modules") }
-  });
+    try {
+      // 1) Generate each part sequentially
+      const rawFiles = [];
+      for (let i = 0; i < parts.length; i++) {
+        if (parts.length > 1) sendLog(jobId, "progress", `🎬 Generating part ${i + 1}/${parts.length}…`);
+        const raw = await generatePart({ jobId, partIndex: i, cookiesPath, imagePath, prompt: parts[i] });
+        if (!raw) {
+          sendLog(jobId, "error", `❌ Part ${i + 1} failed to generate`);
+          try { fs.unlinkSync(cookiesPath); } catch {}
+          await supabase.from("videos").update({ status: "error", error: `part ${i + 1} failed` }).eq("id", videoRow.id);
+          generationBusy = false; if (onComplete) onComplete(false); return;
+        }
+        rawFiles.push(raw);
+      }
+      try { fs.unlinkSync(cookiesPath); } catch {}
 
-  let rawVideoFile = null;
+      // 2) Concatenate parts (if more than one) into a single base video
+      let rawVideoFile;
+      if (rawFiles.length > 1) {
+        sendLog(jobId, "progress", "🔗 Joining parts…");
+        const joined = await videoLib.concatParts(
+          rawFiles.map(f => path.join(outDir, f)), outDir, `flow_${jobId}`
+        );
+        rawVideoFile = path.basename(joined);
+        sendLog(jobId, "success", `✅ Joined ${rawFiles.length} parts: ${rawVideoFile}`);
+      } else {
+        rawVideoFile = rawFiles[0];
+      }
 
-  proc.stdout.on("data", (data) => {
-    data.toString().split("\n").filter(l => l.trim()).forEach(line => {
-      if (line.startsWith("__VIDEO__:")) { rawVideoFile = line.replace("__VIDEO__:", "").trim(); return; }
-      const type =
-        line.includes("❌") || line.toLowerCase().includes("failed") ? "error" :
-        line.includes("✅") ? "success" :
-        line.includes("→") || line.includes("Polling") ? "progress" : "info";
-      sendLog(jobId, type, line.replace(/\r/g, ""));
-    });
-  });
-  proc.stderr.on("data", (data) => {
-    data.toString().split("\n").filter(l => l.trim()).forEach(line => {
-      if (!line.includes("DeprecationWarning") && !line.includes("ExperimentalWarning"))
-        sendLog(jobId, "warn", line);
-    });
-  });
+      await supabase.from("videos").update({ raw_file: rawVideoFile, title: videoTitle }).eq("id", videoRow.id);
+      sendLog(jobId, "success", `🎬 Raw video ready: ${rawVideoFile}`);
 
-  proc.on("close", async (code) => {
-    try { fs.unlinkSync(scriptPath); } catch {}
-    try { fs.unlinkSync(cookiesPath); } catch {}
+      // 3) Composite frame + outro on the (possibly joined) video
+      let finalName = rawVideoFile;
+      try {
+        const framePng = client.frame_path ? path.join(__dirname, "assets", client.frame_path) : null;
+        const outroClip = client.outro_path ? path.join(__dirname, "assets", client.outro_path) : null;
+        if (framePng || outroClip) {
+          sendLog(jobId, "progress", "🎨 Compositing (frame · outro)…");
+          const finalPath = await videoLib.compose({
+            videoIn: path.join(outDir, rawVideoFile),
+            framePng, outroClip, outDir,
+            baseName: path.parse(rawVideoFile).name
+          });
+          finalName = path.basename(finalPath);
+          sendLog(jobId, "success", `✅ Composited: ${finalName}`);
+        } else {
+          sendLog(jobId, "info", "No frame/outro configured — skipping compositing");
+        }
+      } catch (e) {
+        sendLog(jobId, "error", `Compositing failed: ${e.message}`);
+      }
 
-    if (!rawVideoFile) {
-      sendLog(jobId, "error", `❌ Generation failed (exit ${code})`);
-      await supabase.from("videos").update({ status: "error", error: "flow generation failed" }).eq("id", videoRow.id);
+      await supabase.from("videos").update({ final_file: finalName, status: "composited" }).eq("id", videoRow.id);
+      sendLog(jobId, "video", finalName);
+
+      const finalFull = path.join(outDir, finalName);
+
+      // 4) Drive upload — filename = prompt TITLE (not client name)
+      if (client.upload_to_drive) {
+        if (!client.youtube_tokens) {
+          sendLog(jobId, "warn", "Drive upload skipped — Google account not connected for this client");
+        } else {
+          try {
+            sendLog(jobId, "progress", "☁️  Uploading to Google Drive…");
+            const link = await googleLib.uploadToDrive({
+              tokens: client.youtube_tokens, filePath: finalFull,
+              name: `${videoTitle}.mp4`,
+              folderId: client.drive_folder_id
+            });
+            await supabase.from("videos").update({ drive_url: link }).eq("id", videoRow.id);
+            sendLog(jobId, "success", `✅ Drive: ${link}`);
+          } catch (e) { sendLog(jobId, "error", `Drive upload failed: ${e.message}`); }
+        }
+      }
+
+      // 5) YouTube upload — title = prompt TITLE
+      if (client.upload_to_youtube && client.youtube_tokens) {
+        try {
+          sendLog(jobId, "progress", "📺 Preparing YouTube metadata…");
+          const meta = await groqLib.generateYouTubeMeta({
+            businessName: client.name, businessDetails: client.business_details,
+            topic: videoTitle, prompt, defaultTags: client.yt_tags || client.yt_default_tags
+          });
+          const title = videoTitle;   // use the prompt's title, not client name
+          const hashtags = (client.yt_hashtags
+            ? client.yt_hashtags.split(",").map(h => h.trim()).filter(Boolean).map(h => h.startsWith("#") ? h : "#" + h).join(" ")
+            : (meta.hashtags || ""));
+          const descBase = applyTpl(client.yt_desc_tpl, { description: meta.description, client: client.name })
+            || meta.description || "";
+          const description = `${descBase}\n\n${hashtags}`.trim();
+          const tagSet = [
+            ...String(client.yt_tags || "").split(","),
+            ...String(meta.tags || "").split(",")
+          ].map(t => t.trim()).filter(Boolean);
+          const tags = [...new Set(tagSet)];
+
+          sendLog(jobId, "progress", "📺 Uploading to YouTube…");
+          const yt = await googleLib.uploadToYouTube({
+            tokens: client.youtube_tokens, filePath: finalFull,
+            title, description, tags,
+            onLog: (m) => sendLog(jobId, "info", m)
+          });
+          await supabase.from("videos").update({
+            youtube_url: yt, title, description, hashtags, tags: tags.join(", ")
+          }).eq("id", videoRow.id);
+          sendLog(jobId, "success", `✅ YouTube: ${yt}`);
+        } catch (e) { sendLog(jobId, "error", `YouTube upload failed: ${e.message}`); }
+      } else if (client.upload_to_youtube) {
+        sendLog(jobId, "warn", "YouTube upload skipped — channel not connected (Configure YouTube)");
+      }
+
+      await supabase.from("videos").update({ status: "uploaded" }).eq("id", videoRow.id);
+      if (videoRow.calendar_item_id)
+        await supabase.from("calendar_items").update({ status: "done" }).eq("id", videoRow.calendar_item_id);
+      sendLog(jobId, "success", "🏁 Done");
+      generationBusy = false;
+      if (onComplete) onComplete(true);
+    } catch (e) {
+      sendLog(jobId, "error", `Pipeline error: ${e.message}`);
+      try { fs.unlinkSync(cookiesPath); } catch {}
+      await supabase.from("videos").update({ status: "error", error: e.message }).eq("id", videoRow.id);
       generationBusy = false;
       if (onComplete) onComplete(false);
-      return;
     }
-
-    await supabase.from("videos").update({ raw_file: rawVideoFile }).eq("id", videoRow.id);
-    sendLog(jobId, "success", `🎬 Raw video ready: ${rawVideoFile}`);
-
-    // ---- composite frame + outro ----
-    let finalName = rawVideoFile;
-    try {
-      const framePng = client.frame_path ? path.join(__dirname, "assets", client.frame_path) : null;
-      const outroClip = client.outro_path ? path.join(__dirname, "assets", client.outro_path) : null;
-
-      if (framePng || outroClip) {
-        sendLog(jobId, "progress", "🎨 Compositing (frame · outro)…");
-        const finalPath = await videoLib.compose({
-          videoIn: path.join(__dirname, "outputs", rawVideoFile),
-          framePng, outroClip,
-          outDir: path.join(__dirname, "outputs"),
-          baseName: path.parse(rawVideoFile).name
-        });
-        finalName = path.basename(finalPath);
-        sendLog(jobId, "success", `✅ Composited: ${finalName}`);
-      } else {
-        sendLog(jobId, "info", "No frame/outro configured — skipping compositing");
-      }
-    } catch (e) {
-      sendLog(jobId, "error", `Compositing failed: ${e.message}`);
-    }
-
-    await supabase.from("videos").update({ final_file: finalName, status: "composited" }).eq("id", videoRow.id);
-    sendLog(jobId, "video", finalName);
-
-    const finalFull = path.join(__dirname, "outputs", finalName);
-
-    // ---- Drive upload ----
-    if (client.upload_to_drive) {
-      if (!client.youtube_tokens) {
-        sendLog(jobId, "warn", "Drive upload skipped — Google account not connected for this client");
-      } else {
-        try {
-          sendLog(jobId, "progress", "☁️  Uploading to Google Drive…");
-          const link = await googleLib.uploadToDrive({
-            tokens: client.youtube_tokens, filePath: finalFull,
-            name: `${client.name} - ${topic || finalName}.mp4`,
-            folderId: client.drive_folder_id
-          });
-          await supabase.from("videos").update({ drive_url: link }).eq("id", videoRow.id);
-          sendLog(jobId, "success", `✅ Drive: ${link}`);
-        } catch (e) { sendLog(jobId, "error", `Drive upload failed: ${e.message}`); }
-      }
-    }
-
-    // ---- YouTube upload (official API) ----
-    if (client.upload_to_youtube && client.youtube_tokens) {
-      try {
-        sendLog(jobId, "progress", "📺 Preparing YouTube metadata…");
-        const meta = await groqLib.generateYouTubeMeta({
-          businessName: client.name, businessDetails: client.business_details,
-          topic, prompt, defaultTags: client.yt_tags || client.yt_default_tags
-        });
-
-        // apply client templates / defaults
-        const title = applyTpl(client.yt_title_tpl, { title: meta.title, client: client.name, topic })
-          || meta.title;
-        const hashtags = (client.yt_hashtags
-          ? client.yt_hashtags.split(",").map(h => h.trim()).filter(Boolean).map(h => h.startsWith("#") ? h : "#" + h).join(" ")
-          : (meta.hashtags || ""));
-        const descBase = applyTpl(client.yt_desc_tpl, { description: meta.description, client: client.name })
-          || meta.description || "";
-        const description = `${descBase}\n\n${hashtags}`.trim();
-        const tagSet = [
-          ...String(client.yt_tags || "").split(","),
-          ...String(meta.tags || "").split(",")
-        ].map(t => t.trim()).filter(Boolean);
-        const tags = [...new Set(tagSet)];
-
-        sendLog(jobId, "progress", "📺 Uploading to YouTube…");
-        const yt = await googleLib.uploadToYouTube({
-          tokens: client.youtube_tokens, filePath: finalFull,
-          title, description, tags,
-          onLog: (m) => sendLog(jobId, "info", m)
-        });
-        await supabase.from("videos").update({
-          youtube_url: yt, title, description,
-          hashtags, tags: tags.join(", ")
-        }).eq("id", videoRow.id);
-        sendLog(jobId, "success", `✅ YouTube: ${yt}`);
-      } catch (e) { sendLog(jobId, "error", `YouTube upload failed: ${e.message}`); }
-    } else if (client.upload_to_youtube) {
-      sendLog(jobId, "warn", "YouTube upload skipped — channel not connected (Configure YouTube)");
-    }
-
-    await supabase.from("videos").update({ status: "uploaded" }).eq("id", videoRow.id);
-    if (videoRow.calendar_item_id)
-      await supabase.from("calendar_items").update({ status: "done" }).eq("id", videoRow.calendar_item_id);
-    sendLog(jobId, "success", "🏁 Done");
-    generationBusy = false;
-    if (onComplete) onComplete(true);
-  });
+  })();
 }
 
 // ====================================================================

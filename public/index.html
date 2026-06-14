@@ -273,6 +273,11 @@ function renderConfig(){
         <div class="hint" id="styleHint"></div></div>
       <div class="field"><label>Custom prompt template (optional — overrides the style above)</label>
         <textarea id="cfgPromptCustom" placeholder="Leave blank to use the selected style. Describe the exact prompt structure you want Groq to follow.">${esc(c.prompt_custom||"")}</textarea></div>
+      <div class="field"><label>Sample prompt (Groq imitates this style/structure for this client)</label>
+        <textarea id="cfgPromptSample" placeholder="Paste an example of a perfect prompt for this client. Groq will copy its structure, length, tone and formatting for new topics.">${esc(c.prompt_sample||"")}</textarea>
+        <div class="hint">A reusable example. New prompts will match its shape, adapted to each topic.</div></div>
+      <div class="field"><label><input type="checkbox" id="cfgSplitParts" ${c.split_parts?'checked':''}> Split each video into TWO 10-second parts, then join (20s total)</label>
+        <div class="hint">When on, Groq writes the prompt as PART 1 / PART 2; each is generated separately and concatenated, then frame + outro are applied to the combined video.</div></div>
     </div>
 
     <div class="card">
@@ -298,7 +303,7 @@ function renderConfig(){
         <div class="upload-zone"><input type="file" id="refFile" accept="image/*"><div>🧷 Reference image</div>
           <div class="upload-name" id="refName">${c.reference_image_path?'✓ '+esc(c.reference_image_path):''}</div></div>
         <div class="hint">When set, this image is sent with every prompt — no need to upload it each time. (A per-generation upload still overrides it.)</div>
-        ${c.reference_image_path?`<img src="/assets/${esc(c.reference_image_path)}" style="max-height:120px;border-radius:8px;margin-top:8px;border:1px solid var(--border2)">`:''}
+        ${c.reference_image_path?`<img src="/assets/${esc(c.reference_image_path)}" style="max-height:120px;border-radius:8px;margin-top:8px;border:1px solid var(--border2)"><div><button type="button" class="btn btn-sm" style="margin-top:8px;background:#c0392b;color:#fff;border:none" onclick="deleteRefImage('${c.id}')">🗑️ Delete reference image</button></div>`:''}
       </div>
     </div>
 
@@ -414,6 +419,8 @@ async function saveConfig(){
     // prompt style
     if($("cfgStyle")) fd.append("prompt_style", $("cfgStyle").value);
     if($("cfgPromptCustom")) fd.append("prompt_custom", $("cfgPromptCustom").value);
+    if($("cfgPromptSample")) fd.append("prompt_sample", $("cfgPromptSample").value);
+    if($("cfgSplitParts")) fd.append("split_parts", $("cfgSplitParts").checked);
     const cats=[...document.querySelectorAll(".catChk:checked")].map(c=>c.value).join(",");
     fd.append("rss_categories", cats);
     if($("frameFile").files[0]) fd.append("frame", $("frameFile").files[0]);
@@ -426,6 +433,13 @@ async function saveConfig(){
     toast("Saved ✓"); renderConfig();
   }catch(e){ toast("Error: "+e.message); }
   btn.disabled=false; btn.textContent="Save config";
+}
+async function deleteRefImage(id){
+  if(!confirm("Delete this client's reference image?")) return;
+  try{
+    currentClient = await api("/api/clients/"+id+"/reference-image",{method:"DELETE"});
+    toast("Reference image deleted ✓"); renderConfig();
+  }catch(e){ toast("Error: "+e.message); }
 }
 async function deleteClient(){
   if(!confirm("Delete "+currentClient.name+" and all its videos?")) return;
