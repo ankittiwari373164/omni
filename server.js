@@ -698,26 +698,43 @@ async function runRssScheduler() {
 
       console.log(`📰 RSS [${client.name}] ${fresh.length} new article(s) to generate`);
       for (const it of fresh) {
-        const { data: ci } = await supabase.from("calendar_items").insert({
-          client_id: client.id, topic: it.title, hook: it.summary, link: it.link,
-          source: "rss", scheduled_date: today, status: "generating"
-        }).select().single();
+        let ci = null;
+        try {
+          const ins = await supabase.from("calendar_items").insert({
+            client_id: client.id, topic: it.title, hook: it.summary, link: it.link,
+            source: "rss", scheduled_date: today, status: "generating"
+          }).select().single();
+          ci = ins.data;
 
-        const prompt = await groqLib.generateNewsPrompt({
-          businessName: client.name, businessDetails: client.business_details,
-          title: it.title, summary: it.summary
-        });
-        await supabase.from("calendar_items").update({ prompt }).eq("id", ci.id);
+          const prompt = await groqLib.generateNewsPrompt({
+            businessName: client.name, businessDetails: client.business_details,
+            title: it.title, summary: it.summary
+          });
+          await supabase.from("calendar_items").update({ prompt }).eq("id", ci.id);
 
-        if (process.env.DASHBOARD_ONLY === "1") {
-          // Render: just queue it for the local poller; don't launch a browser.
-          await supabase.from("calendar_items").update({ status: "prompt_ready" }).eq("id", ci.id);
-          continue;
+          if (process.env.DASHBOARD_ONLY === "1") {
+            await supabase.from("calendar_items").update({ status: "prompt_ready" }).eq("id", ci.id);
+            continue;
+          }
+
+          await waitUntilFree();
+          await generateOne({ client, prompt, topic: it.title, calItemId: ci.id, link: it.link });
+        } catch (articleErr) {
+          // Mark this item as error so it is NOT retried forever (its link is
+          // now recorded, so it won't be picked up as "fresh" again).
+          console.log(`  ✗ RSS article failed (${client.name}): ${articleErr.message}`);
+          if (ci?.id) {
+            await supabase.from("calendar_items").update({ status: "error", error: articleErr.message }).eq("id", ci.id);
+          } else {
+            // insert failed — record the link so we don't loop on it
+            await supabase.from("calendar_items").insert({
+              client_id: client.id, topic: it.title, link: it.link, source: "rss",
+              scheduled_date: today, status: "error", error: articleErr.message
+            });
+          }
         }
-
-        await waitUntilFree();
-        await generateOne({ client, prompt, topic: it.title, calItemId: ci.id, link: it.link });
       }
+      // Always record the run so the scheduler doesn't immediately re-run.
       await supabase.from("clients").update({ last_rss_run: today }).eq("id", client.id);
     } catch (e) {
       console.log(`RSS scheduler error for ${client.name}:`, e.message);
