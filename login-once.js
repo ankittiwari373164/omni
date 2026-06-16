@@ -40,13 +40,13 @@ function waitEnter(msg) {
   try {
     context = await chromium.launchPersistentContext(profileDir, {
       headless: false, channel: "chrome", viewport: null,
-      args: ["--start-maximized", "--no-sandbox", "--disable-setuid-sandbox"]
+      args: ["--start-maximized", "--disable-blink-features=AutomationControlled"], ignoreDefaultArgs: ["--enable-automation"]
     });
   } catch (e) {
     console.log("Real Chrome not found, using bundled Chromium");
     context = await chromium.launchPersistentContext(profileDir, {
       headless: false, viewport: null,
-      args: ["--start-maximized", "--no-sandbox", "--disable-setuid-sandbox"]
+      args: ["--start-maximized", "--disable-blink-features=AutomationControlled"], ignoreDefaultArgs: ["--enable-automation"]
     });
   }
   const page = context.pages()[0] || await context.newPage();
