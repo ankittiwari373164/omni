@@ -294,7 +294,12 @@ app.post("/api/clients/:id/generate", upload.fields([{ name: "image", maxCount: 
   try {
     const { data: client } = await supabase.from("clients").select("*").eq("id", req.params.id).single();
     if (!client) return res.status(404).json({ error: "client not found" });
-    if (!client.cookies) return res.status(400).json({ error: "client has no cookies configured" });
+    // Allow generation if EITHER cookies are configured OR a persistent login
+    // profile exists for this client (profiles/<id>). Profile is preferred.
+    const hasProfile = fs.existsSync(path.join(__dirname, "profiles", String(client.id)));
+    if (!client.cookies && !hasProfile && process.env.DASHBOARD_ONLY !== "1") {
+      return res.status(400).json({ error: "client has no login profile or cookies. Run: node login-once.js " + client.id });
+    }
 
     // Make sure this client's assets (reference image, frame, outro) exist on
     // THIS machine's local assets/ folder — download any missing ones from
@@ -330,8 +335,11 @@ app.post("/api/clients/:id/generate", upload.fields([{ name: "image", maxCount: 
     if (!prompt) return res.status(400).json({ error: "prompt or calendar_item_id required" });
 
     // write cookies to a temp file for the playwright script
-    const cookiesPath = path.join(__dirname, "uploads", `cookies_${uuidv4()}.json`);
-    fs.writeFileSync(cookiesPath, JSON.stringify(client.cookies));
+    let cookiesPath = null;
+    if (client.cookies) {
+      cookiesPath = path.join(__dirname, "uploads", `cookies_${uuidv4()}.json`);
+      fs.writeFileSync(cookiesPath, JSON.stringify(client.cookies));
+    }
 
     let imagePath = null;
     if (req.files?.image?.[0]) {
@@ -590,8 +598,11 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
 
 // Reusable: run one full generation and resolve when the pipeline finishes.
 function generateOne({ client, prompt, topic, calItemId, link }) {
-  const cookiesPath = path.join(__dirname, "uploads", `cookies_${uuidv4()}.json`);
-  fs.writeFileSync(cookiesPath, JSON.stringify(client.cookies));
+  let cookiesPath = null;
+  if (client.cookies) {
+    cookiesPath = path.join(__dirname, "uploads", `cookies_${uuidv4()}.json`);
+    fs.writeFileSync(cookiesPath, JSON.stringify(client.cookies));
+  }
 
   const jobId = uuidv4();
   jobs.set(jobId, { logs: [], ws: null, clientId: client.id });
