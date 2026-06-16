@@ -400,12 +400,12 @@ function deriveTitle(prompt) {
 }
 
 // Generate ONE clip for a single prompt part. Resolves to the raw filename or null.
-function generatePart({ jobId, partIndex, cookiesPath, imagePath, prompt }) {
+function generatePart({ jobId, partIndex, cookiesPath, profileDir, imagePath, prompt }) {
   return new Promise((resolve) => {
     const partJob = `${jobId}_p${partIndex}`;
     const scriptPath = path.join(__dirname, "uploads", `script_${partJob}.js`);
     fs.writeFileSync(scriptPath, buildScript({
-      cookiesPath, imagePath,
+      cookiesPath, profileDir, imagePath,
       prompt: String(prompt).replace(/\s*\n+\s*/g, " ").trim(),
       aspectRatio: "9:16", speed: "1x", duration: "10s", jobId: partJob
     }));
@@ -443,6 +443,11 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
   generationBusy = true;
   (async () => {
     const outDir = path.join(__dirname, "outputs");
+    // Per-client persistent Chrome profile (logged in once via login-once.js).
+    // If it exists, generation uses it (no cookie expiry). Else falls back to cookies.
+    const candidateProfile = path.join(__dirname, "profiles", String(client.id));
+    const profileDir = fs.existsSync(candidateProfile) ? candidateProfile : null;
+    if (profileDir) sendLog(jobId, "info", "🔐 Using persistent login profile");
     prompt = groqLib.sanitizePrompt(prompt);   // safety net for manual prompts too
     const parts = groqLib.splitPromptParts(prompt);
     const videoTitle = (topic && topic.trim()) || deriveTitle(prompt);
@@ -456,7 +461,7 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
       const rawFiles = [];
       for (let i = 0; i < parts.length; i++) {
         if (parts.length > 1) sendLog(jobId, "progress", `🎬 Generating part ${i + 1}/${parts.length}…`);
-        const raw = await generatePart({ jobId, partIndex: i, cookiesPath, imagePath, prompt: parts[i] });
+        const raw = await generatePart({ jobId, partIndex: i, cookiesPath, profileDir, imagePath, prompt: parts[i] });
         if (!raw) {
           sendLog(jobId, "error", `❌ Part ${i + 1} failed to generate`);
           try { fs.unlinkSync(cookiesPath); } catch {}
