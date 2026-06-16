@@ -34,6 +34,7 @@ const upload = multer({ dest: "uploads/" });
 
 // ── live job log streaming ─────────────────────────────────────────
 const jobs = new Map(); // jobId -> { logs:[], ws, videoId }
+let generationBusy = false; // true while a Flow browser session is running (serializes generations)
 
 wss.on("connection", (ws, req) => {
   const jobId = new URL(req.url, "http://localhost").searchParams.get("jobId");
@@ -120,7 +121,7 @@ app.get("/api/health", async (req, res) => {
     const { error } = await supabase.from("clients").select("id").limit(1);
     if (error) db = "error: " + error.message;
   } catch (e) { db = "unreachable: " + e.message; }
-  res.json({ env, db });
+  res.json({ env, db, busy: generationBusy });
 });
 
 app.get("/api/clients/:id", async (req, res) => {
@@ -379,6 +380,16 @@ app.post("/api/clients/:id/generate", upload.fields([{ name: "image", maxCount: 
         message: "Queued for your local PC. Make sure poller.js is running there." });
     }
 
+    // SERIALIZE: only one Flow browser session at a time. A persistent profile
+    // can be opened by exactly one Chrome instance, so concurrent jobs (e.g. the
+    // poller firing several due items at once) would collide with
+    // "profile already in use". Tell the caller we're busy; it will retry later.
+    if (generationBusy) {
+      try { fs.existsSync(cookiesPath) && fs.unlinkSync(cookiesPath); } catch {}
+      return res.status(409).json({ busy: true, error: "a generation is already running; try again shortly" });
+    }
+    generationBusy = true;   // claim the lock synchronously, before any await
+
     const { data: videoRow } = await supabase.from("videos").insert({
       client_id: client.id, calendar_item_id: calItemId, prompt,
       title: topic || client.name, status: "generating"
@@ -390,6 +401,7 @@ app.post("/api/clients/:id/generate", upload.fields([{ name: "image", maxCount: 
 
     runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, topic });
   } catch (e) {
+    generationBusy = false;   // release lock if we failed before the pipeline took over
     res.status(500).json({ error: e.message });
   }
 });
@@ -397,7 +409,6 @@ app.post("/api/clients/:id/generate", upload.fields([{ name: "image", maxCount: 
 // ====================================================================
 //  PIPELINE: Flow generate → composite frame+outro → upload Drive/YouTube
 // ====================================================================
-let generationBusy = false; // true while a Flow browser session is running
 
 // Derive a short human title from a prompt when no topic is set (manual prompts).
 function deriveTitle(prompt) {
@@ -423,10 +434,12 @@ function generatePart({ jobId, partIndex, cookiesPath, profileDir, imagePath, pr
       env: { ...process.env, NODE_ENV: "production", NODE_PATH: path.join(__dirname, "node_modules") }
     });
     let rawVideoFile = null;
+    let policyHit = false;
 
     proc.stdout.on("data", (data) => {
       data.toString().split("\n").filter(l => l.trim()).forEach(line => {
         if (line.startsWith("__VIDEO__:")) { rawVideoFile = line.replace("__VIDEO__:", "").trim(); return; }
+        if (/Policy violation|Ended: policy/i.test(line)) policyHit = true;
         const type =
           line.includes("❌") || line.toLowerCase().includes("failed") ? "error" :
           line.includes("✅") ? "success" :
@@ -442,7 +455,7 @@ function generatePart({ jobId, partIndex, cookiesPath, profileDir, imagePath, pr
     });
     proc.on("close", () => {
       try { fs.unlinkSync(scriptPath); } catch {}
-      resolve(rawVideoFile);
+      resolve({ file: rawVideoFile, policy: policyHit });
     });
   });
 }
@@ -461,22 +474,56 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
     const videoTitle = (topic && topic.trim()) || deriveTitle(prompt);
 
     sendLog(jobId, "info", `🚀 Generating for ${client.name}`);
-    if (parts.length > 1) sendLog(jobId, "info", `🧩 Prompt split into ${parts.length} parts — will concatenate`);
     sendLog(jobId, "info", `📋 ${prompt.slice(0, 90)}${prompt.length > 90 ? "…" : ""}`);
 
     try {
-      // 1) Generate each part sequentially
-      const rawFiles = [];
-      for (let i = 0; i < parts.length; i++) {
-        if (parts.length > 1) sendLog(jobId, "progress", `🎬 Generating part ${i + 1}/${parts.length}…`);
-        const raw = await generatePart({ jobId, partIndex: i, cookiesPath, profileDir, imagePath, prompt: parts[i] });
-        if (!raw) {
-          sendLog(jobId, "error", `❌ Part ${i + 1} failed to generate`);
-          try { fs.unlinkSync(cookiesPath); } catch {}
-          await supabase.from("videos").update({ status: "error", error: `part ${i + 1} failed` }).eq("id", videoRow.id);
-          generationBusy = false; if (onComplete) onComplete(false); return;
+      // 1) Generate each part — with auto-retry on policy violation / failure.
+      //    On a policy hit we regenerate a fresh, safer prompt and try again.
+      const MAX_ATTEMPTS = 3;
+      let rawFiles = [];
+      let currentPrompt = prompt;
+      let success = false;
+
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS && !success; attempt++) {
+        const parts = groqLib.splitPromptParts(currentPrompt);
+        if (parts.length > 1) sendLog(jobId, "info", `🧩 Split into ${parts.length} parts`);
+        rawFiles = [];
+        let failed = false, policy = false;
+
+        for (let i = 0; i < parts.length; i++) {
+          if (parts.length > 1) sendLog(jobId, "progress", `🎬 Generating part ${i + 1}/${parts.length}…`);
+          const res = await generatePart({ jobId, partIndex: i, cookiesPath, profileDir, imagePath, prompt: parts[i] });
+          if (!res.file) { failed = true; policy = res.policy; break; }
+          rawFiles.push(res.file);
         }
-        rawFiles.push(raw);
+
+        if (!failed) { success = true; break; }
+
+        // Failed this attempt. Retry with a freshly generated, safer prompt.
+        if (attempt < MAX_ATTEMPTS) {
+          sendLog(jobId, "warn", policy
+            ? `⚠️ Policy violation — regenerating a safer prompt (attempt ${attempt + 1}/${MAX_ATTEMPTS})`
+            : `⚠️ Generation failed — retrying with a fresh prompt (attempt ${attempt + 1}/${MAX_ATTEMPTS})`);
+          try {
+            const fresh = await groqLib.generatePrompt({
+              businessName: client.name, businessDetails: client.business_details,
+              topic: videoTitle, styleKey: client.prompt_style, styleInstruction: client.prompt_custom,
+              promptSample: client.prompt_sample, splitParts: client.split_parts
+            });
+            currentPrompt = groqLib.sanitizePrompt(fresh);
+            sendLog(jobId, "info", `📋 New prompt: ${currentPrompt.slice(0, 90)}…`);
+          } catch (e) {
+            sendLog(jobId, "error", `Could not regenerate prompt: ${e.message}`);
+            break;
+          }
+        }
+      }
+
+      if (!success) {
+        sendLog(jobId, "error", `❌ Failed after ${MAX_ATTEMPTS} attempts`);
+        try { fs.unlinkSync(cookiesPath); } catch {}
+        await supabase.from("videos").update({ status: "error", error: "failed after retries (policy/other)" }).eq("id", videoRow.id);
+        generationBusy = false; if (onComplete) onComplete(false); return;
       }
       try { fs.unlinkSync(cookiesPath); } catch {}
 
