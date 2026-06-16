@@ -1,8 +1,20 @@
+# Dependencies — never commit, reinstalled via npm install
 node_modules/
+
+# Generated videos & temp files — large, machine-specific
+outputs/
+uploads/
+logs/
+
+# Local assets (synced via Supabase Storage, not git)
+assets/
+
+# Environment & secrets
 .env
-uploads/*
-outputs/*
-assets/*
-!uploads/.gitkeep
-!outputs/.gitkeep
-!assets/.gitkeep
+.env.local
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.log
+profiles/
