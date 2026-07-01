@@ -246,6 +246,9 @@ function renderConfig(){
       <div class="field"><label>Client name</label><input type="text" id="cfgName" value="${esc(c.name)}"></div>
       <div class="field"><label>Business brief (used by Groq for prompts & calendar)</label>
         <textarea id="cfgBrief" placeholder="What the brand sells, tone, audience, key products…">${esc(c.business_details||"")}</textarea></div>
+      <div class="field"><label>ChatGPT chat link (optional — this client's own conversation)</label>
+        <input type="url" id="cfgChatLink" placeholder="https://chatgpt.com/c/xxxxxxxx" value="${esc(c.chatgpt_link||"")}">
+        <div class="hint">Paste a ChatGPT conversation URL to keep this client's prompts in one dedicated chat. Leave blank to use a fresh chat each time.</div></div>
     </div>
 
     <div class="card">
@@ -411,6 +414,7 @@ async function saveConfig(){
     const fd = new FormData();
     fd.append("name", $("cfgName").value);
     fd.append("business_details", $("cfgBrief").value);
+    if($("cfgChatLink")) fd.append("chatgpt_link", $("cfgChatLink").value);
     fd.append("upload_to_drive", $("cfgDrive").checked);
     fd.append("drive_folder_id", $("cfgFolder").value);
     fd.append("mode", $("cfgMode").value);
