@@ -467,7 +467,7 @@ async function renderCalendar(){
       ` : `
         <div class="section-label">Generate content calendar (Groq)</div>
         <div class="btn-row">
-          <label>Days <input type="number" id="calDays" value="7" min="1" max="30" style="width:70px;display:inline-block"></label>
+          <label>Days <input type="number" id="calDays" value="30" min="1" max="60" style="width:70px;display:inline-block"></label>
           <label>Start <input type="text" id="calStart" placeholder="YYYY-MM-DD (optional)" style="width:160px;display:inline-block"></label>
           <button class="btn btn-primary btn-sm" id="genCal" onclick="genCalendar()">Generate calendar</button>
         </div>
@@ -508,7 +508,7 @@ function renderCalList(items){
 async function genCalendar(){
   const btn=$("genCal"); btn.disabled=true; btn.textContent="Generating…";
   try{
-    const body={days:Number($("calDays").value)||7}; const s=$("calStart").value.trim(); if(s) body.startDate=s;
+    const body={days:Number($("calDays").value)||30}; const s=$("calStart").value.trim(); if(s) body.startDate=s;
     await api("/api/clients/"+currentClient.id+"/calendar/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
     renderCalendar(); toast("Calendar generated ✓");
   }catch(e){ toast("Error: "+e.message); }
