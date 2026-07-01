@@ -152,6 +152,7 @@ app.post("/api/clients/:id/config", upload.fields([
   const b = req.body;
   if (b.name !== undefined) patch.name = b.name;
   if (b.business_details !== undefined) patch.business_details = b.business_details;
+  if (b.chatgpt_link !== undefined) patch.chatgpt_link = b.chatgpt_link || null;
   if (b.prompt_sample !== undefined) patch.prompt_sample = b.prompt_sample || null;
   if (b.split_parts !== undefined) patch.split_parts = b.split_parts === "true" || b.split_parts === true;
   if (b.upload_to_drive !== undefined) patch.upload_to_drive = b.upload_to_drive === "true";
@@ -235,7 +236,7 @@ app.post("/api/clients/:id/calendar/generate", async (req, res) => {
 
     const items = await groqLib.generateCalendar({
       businessName: client.name,
-      businessDetails: client.business_details,
+      businessDetails: client.business_details, chatLink: client.chatgpt_link,
       days, startDate
     });
 
@@ -257,11 +258,11 @@ app.post("/api/calendar/:itemId/prompt", async (req, res) => {
 
     const prompt = item.source === "rss"
       ? await groqLib.generateNewsPrompt({
-          businessName: client.name, businessDetails: client.business_details,
+          businessName: client.name, businessDetails: client.business_details, chatLink: client.chatgpt_link,
           title: item.topic, summary: item.hook
         })
       : await groqLib.generatePrompt({
-          businessName: client.name, businessDetails: client.business_details,
+          businessName: client.name, businessDetails: client.business_details, chatLink: client.chatgpt_link,
           topic: item.topic, hook: item.hook,
           styleKey: client.prompt_style, styleInstruction: client.prompt_custom,
               promptSample: client.prompt_sample, splitParts: client.split_parts
@@ -321,11 +322,11 @@ app.post("/api/clients/:id/generate", upload.fields([{ name: "image", maxCount: 
       if (!prompt) {
         prompt = item.source === "rss"
           ? await groqLib.generateNewsPrompt({
-              businessName: client.name, businessDetails: client.business_details,
+              businessName: client.name, businessDetails: client.business_details, chatLink: client.chatgpt_link,
               title: item.topic, summary: item.hook
             })
           : await groqLib.generatePrompt({
-              businessName: client.name, businessDetails: client.business_details,
+              businessName: client.name, businessDetails: client.business_details, chatLink: client.chatgpt_link,
               topic: item.topic, hook: item.hook,
               styleKey: client.prompt_style, styleInstruction: client.prompt_custom,
                   promptSample: client.prompt_sample, splitParts: client.split_parts
@@ -506,7 +507,7 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
             : `⚠️ Generation failed — retrying with a fresh prompt (attempt ${attempt + 1}/${MAX_ATTEMPTS})`);
           try {
             const fresh = await groqLib.generatePrompt({
-              businessName: client.name, businessDetails: client.business_details,
+              businessName: client.name, businessDetails: client.business_details, chatLink: client.chatgpt_link,
               topic: videoTitle, styleKey: client.prompt_style, styleInstruction: client.prompt_custom,
               promptSample: client.prompt_sample, splitParts: client.split_parts
             });
@@ -592,7 +593,7 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
         try {
           sendLog(jobId, "progress", "📺 Preparing YouTube metadata…");
           const meta = await groqLib.generateYouTubeMeta({
-            businessName: client.name, businessDetails: client.business_details,
+            businessName: client.name, businessDetails: client.business_details, chatLink: client.chatgpt_link,
             topic: videoTitle, prompt, defaultTags: client.yt_tags || client.yt_default_tags
           });
           const title = videoTitle;   // use the prompt's title, not client name
@@ -754,7 +755,7 @@ async function runRssScheduler() {
           ci = ins.data;
 
           const prompt = await groqLib.generateNewsPrompt({
-            businessName: client.name, businessDetails: client.business_details,
+            businessName: client.name, businessDetails: client.business_details, chatLink: client.chatgpt_link,
             title: it.title, summary: it.summary
           });
           await supabase.from("calendar_items").update({ prompt }).eq("id", ci.id);
