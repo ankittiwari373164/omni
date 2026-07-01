@@ -580,13 +580,14 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
 
       // 4) Drive upload — filename = prompt TITLE (not client name)
       if (client.upload_to_drive) {
-        if (!client.youtube_tokens) {
-          sendLog(jobId, "warn", "Drive upload skipped — Google account not connected for this client");
+        const driveTokens = client.drive_tokens || client.youtube_tokens; // separate creds, legacy fallback
+        if (!driveTokens) {
+          sendLog(jobId, "warn", "Drive upload skipped — Drive not connected for this client");
         } else {
           try {
             sendLog(jobId, "progress", "☁️  Uploading to Google Drive…");
             const link = await googleLib.uploadToDrive({
-              tokens: client.youtube_tokens, filePath: finalFull,
+              tokens: driveTokens, filePath: finalFull,
               name: `${videoTitle}.mp4`,
               folderId: client.drive_folder_id
             });
@@ -838,6 +839,13 @@ app.post("/api/clients/:id/youtube/disconnect", async (req, res) => {
   res.json({ ok: true });
 });
 
+app.post("/api/clients/:id/drive/disconnect", async (req, res) => {
+  const { error } = await supabase.from("clients")
+    .update({ drive_tokens: null }).eq("id", req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+});
+
 // ====================================================================
 //  GOOGLE OAUTH (Drive + YouTube) — per client
 // ====================================================================
@@ -847,13 +855,38 @@ app.get("/api/oauth/google/start", (req, res) => {
   res.redirect(googleLib.getAuthUrl(clientId));
 });
 
+// Separate per-service connect flows. service = "youtube" | "drive".
+app.get("/api/oauth/:service/start", (req, res) => {
+  const clientId = req.query.client_id;
+  const service = req.params.service;
+  if (!clientId) return res.status(400).send("client_id required");
+  if (service !== "youtube" && service !== "drive") return res.status(400).send("bad service");
+  res.redirect(googleLib.getServiceAuthUrl(clientId, service));
+});
+
 app.get("/api/oauth/google/callback", async (req, res) => {
   try {
-    const { code, state } = req.query; // state = our client id
+    const { code, state } = req.query;
+    // state is either "<clientId>" (legacy combined) or "<clientId>::<service>".
+    const [clientId, service] = String(state || "").split("::");
     const { tokens, channelName } = await googleLib.exchangeCode(code);
-    await supabase.from("clients").update({ youtube_tokens: tokens, youtube_channel: channelName || null }).eq("id", state);
+
+    let patch, label;
+    if (service === "drive") {
+      patch = { drive_tokens: tokens };
+      label = "Google Drive";
+    } else if (service === "youtube") {
+      patch = { youtube_tokens: tokens, youtube_channel: channelName || null };
+      label = channelName ? `YouTube (${channelName})` : "YouTube";
+    } else {
+      // legacy combined connect — populate BOTH so old flow still works
+      patch = { youtube_tokens: tokens, drive_tokens: tokens, youtube_channel: channelName || null };
+      label = channelName ? `Google (${channelName})` : "Google";
+    }
+    await supabase.from("clients").update(patch).eq("id", clientId);
+
     res.send(`<html><body style="font-family:sans-serif;background:#0a0a0f;color:#e8e8f0;padding:40px">
-      ✅ Google account connected${channelName ? ` (channel: ${channelName})` : ""}. You can close this tab and return to Flow Studio.
+      ✅ ${label} connected. You can close this tab and return to Flow Studio.
       <script>setTimeout(()=>window.close(),1500)</script></body></html>`);
   } catch (e) {
     res.status(500).send("OAuth failed: " + e.message);
