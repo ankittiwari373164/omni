@@ -230,7 +230,7 @@ app.get("/api/clients/:id/calendar", async (req, res) => {
 // Generate calendar via Groq and store it
 app.post("/api/clients/:id/calendar/generate", async (req, res) => {
   try {
-    const { days = 7, startDate } = req.body;
+    const { days = 30, startDate } = req.body;
     const { data: client } = await supabase.from("clients").select("*").eq("id", req.params.id).single();
     if (!client) return res.status(404).json({ error: "client not found" });
 
@@ -239,6 +239,14 @@ app.post("/api/clients/:id/calendar/generate", async (req, res) => {
       businessDetails: client.business_details, chatLink: client.chatgpt_link,
       days, startDate
     });
+
+    // REPLACE: remove existing not-yet-produced items for this client so the new
+    // calendar takes their place. Keep items already done/generating/uploaded so
+    // we never wipe finished work or an in-progress job.
+    await supabase.from("calendar_items")
+      .delete()
+      .eq("client_id", client.id)
+      .in("status", ["planned", "prompt_ready", "error"]);
 
     const rows = items.map(it => ({ ...it, client_id: client.id, status: "planned" }));
     const { data, error } = await supabase.from("calendar_items").insert(rows).select();
@@ -702,10 +710,22 @@ app.post("/api/clients/:id/rss/fetch", async (req, res) => {
     if (!feeds) return res.status(400).json({ error: "no RSS categories or feeds configured" });
 
     const items = await rssLib.fetchFeeds(feeds, 20);
+
+    // REPLACE: clear old not-yet-produced RSS items so a fresh fetch takes their
+    // place (keeps done/generating/uploaded ones intact).
+    await supabase.from("calendar_items")
+      .delete()
+      .eq("client_id", client.id).eq("source", "rss")
+      .in("status", ["planned", "prompt_ready", "error"]);
+
+    // Dedup only against links we've already PRODUCED (done/uploaded), so the
+    // same article isn't re-made — but articles that were merely planned before
+    // can come back in a fresh fetch.
     const { data: existing } = await supabase.from("calendar_items")
-      .select("link").eq("client_id", client.id).not("link", "is", null);
+      .select("link").eq("client_id", client.id).not("link", "is", null)
+      .in("status", ["done", "uploaded", "generating"]);
     const have = new Set((existing || []).map(e => e.link));
-    const fresh = items.filter(i => !have.has(i.link));
+    const fresh = items.filter(i => !have.has(i.link)).slice(0, client.rss_daily_limit || 10);
 
     let inserted = [];
     if (fresh.length) {
@@ -740,7 +760,8 @@ async function runRssScheduler() {
     try {
       const items = await rssLib.fetchFeeds(feeds, 20);
       const { data: existing } = await supabase.from("calendar_items")
-        .select("link").eq("client_id", client.id).not("link", "is", null);
+        .select("link").eq("client_id", client.id).not("link", "is", null)
+        .in("status", ["done", "uploaded", "generating"]);
       const have = new Set((existing || []).map(e => e.link));
       const fresh = items.filter(i => !have.has(i.link)).slice(0, client.rss_daily_limit || 3);
 
