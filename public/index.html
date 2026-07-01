@@ -148,13 +148,23 @@
     <div class="yt-conn">
       <div class="ic">▶</div>
       <div style="flex:1">
-        <div style="font-size:13px;font-weight:600">Channel connection</div>
+        <div style="font-size:13px;font-weight:600">YouTube connection</div>
         <div id="ytConnValue" class="hint">Not connected</div>
       </div>
       <button class="btn btn-sm" id="ytDisconnectBtn" style="color:var(--red);display:none" onclick="disconnectYoutube()">Disconnect</button>
     </div>
-    <button class="btn btn-primary" style="width:100%;justify-content:center" onclick="connectYoutube()">Connect YouTube channel (Google sign-in)</button>
-    <div class="hint" style="margin-top:6px">Uploads use the official YouTube Data API. On publish we set <b>Public</b> · <b>Not made for kids</b>. Drive uses the same connection.</div>
+    <button class="btn btn-primary" style="width:100%;justify-content:center" onclick="connectYoutube()">Connect YouTube (Google sign-in)</button>
+
+    <div class="yt-conn" style="margin-top:16px">
+      <div class="ic">📁</div>
+      <div style="flex:1">
+        <div style="font-size:13px;font-weight:600">Drive connection</div>
+        <div id="driveConnValue" class="hint">Not connected</div>
+      </div>
+      <button class="btn btn-sm" id="driveDisconnectBtn" style="color:var(--red);display:none" onclick="disconnectDrive()">Disconnect</button>
+    </div>
+    <button class="btn btn-primary" style="width:100%;justify-content:center" onclick="connectDrive()">Connect Drive (Google sign-in)</button>
+    <div class="hint" style="margin-top:6px">Each connects its own Google account. Uploads publish <b>Public</b> · <b>Not made for kids</b>. You can use different accounts for YouTube and Drive.</div>
 
     <div style="height:1px;background:var(--border);margin:18px 0"></div>
 
@@ -376,18 +386,34 @@ function openYoutubeModal(){
     ? '<span style="color:var(--green)">Connected'+(c.youtube_channel?': '+esc(c.youtube_channel):'')+'</span>'
     : 'Not connected';
   $("ytDisconnectBtn").style.display = connected ? "inline-flex" : "none";
+  const driveConnected = !!c.drive_tokens;
+  if($("driveConnValue")) $("driveConnValue").innerHTML = driveConnected
+    ? '<span style="color:var(--green)">Connected</span>' : 'Not connected';
+  if($("driveDisconnectBtn")) $("driveDisconnectBtn").style.display = driveConnected ? "inline-flex" : "none";
   $("ytModal").classList.add("show");
 }
 function connectYoutube(){
-  window.open("/api/oauth/google/start?client_id="+currentClient.id, "_blank", "width=520,height=640");
-  toast("Finish Google sign-in, then reopen this panel to see the channel.");
+  window.open("/api/oauth/youtube/start?client_id="+currentClient.id, "_blank", "width=520,height=640");
+  toast("Finish YouTube sign-in, then reopen this panel.");
+}
+function connectDrive(){
+  window.open("/api/oauth/drive/start?client_id="+currentClient.id, "_blank", "width=520,height=640");
+  toast("Finish Drive sign-in, then reopen this panel.");
 }
 async function disconnectYoutube(){
-  if(!confirm("Disconnect this YouTube/Drive Google account?")) return;
+  if(!confirm("Disconnect this client's YouTube account?")) return;
   try{
     await api("/api/clients/"+currentClient.id+"/youtube/disconnect",{method:"POST"});
     currentClient = await api("/api/clients/"+currentClient.id);
-    openYoutubeModal(); toast("Disconnected");
+    openYoutubeModal(); toast("YouTube disconnected");
+  }catch(e){ toast("Error: "+e.message); }
+}
+async function disconnectDrive(){
+  if(!confirm("Disconnect this client's Drive account?")) return;
+  try{
+    await api("/api/clients/"+currentClient.id+"/drive/disconnect",{method:"POST"});
+    currentClient = await api("/api/clients/"+currentClient.id);
+    openYoutubeModal(); toast("Drive disconnected");
   }catch(e){ toast("Error: "+e.message); }
 }
 async function saveYoutubeConfig(){
