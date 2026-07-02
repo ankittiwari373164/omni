@@ -256,9 +256,12 @@ function renderConfig(){
       <div class="field"><label>Client name</label><input type="text" id="cfgName" value="${esc(c.name)}"></div>
       <div class="field"><label>Business brief (used by Groq for prompts & calendar)</label>
         <textarea id="cfgBrief" placeholder="What the brand sells, tone, audience, key products…">${esc(c.business_details||"")}</textarea></div>
-      <div class="field"><label>ChatGPT chat link (optional — this client's own conversation)</label>
+      <div class="field"><label>ChatGPT chat link for PROMPTS (optional — this client's own text conversation)</label>
         <input type="url" id="cfgChatLink" placeholder="https://chatgpt.com/c/xxxxxxxx" value="${esc(c.chatgpt_link||"")}">
-        <div class="hint">Paste a ChatGPT conversation URL to keep this client's prompts in one dedicated chat. Leave blank to use a fresh chat each time.</div></div>
+        <div class="hint">Used to WRITE the video prompt/script. Leave blank to use a fresh chat each time.</div></div>
+      <div class="field"><label>ChatGPT chat link for IMAGES (optional — a chat with image generation)</label>
+        <input type="url" id="cfgImageChatLink" placeholder="https://chatgpt.com/c/yyyyyyyy" value="${esc(c.image_chat_link||"")}">
+        <div class="hint">Used to CREATE the per-part reference images (must be a chat where ChatGPT can generate images). Leave blank to use a fresh chat each time.</div></div>
     </div>
 
     <div class="card">
@@ -441,6 +444,7 @@ async function saveConfig(){
     fd.append("name", $("cfgName").value);
     fd.append("business_details", $("cfgBrief").value);
     if($("cfgChatLink")) fd.append("chatgpt_link", $("cfgChatLink").value);
+    if($("cfgImageChatLink")) fd.append("image_chat_link", $("cfgImageChatLink").value);
     fd.append("upload_to_drive", $("cfgDrive").checked);
     fd.append("drive_folder_id", $("cfgFolder").value);
     fd.append("mode", $("cfgMode").value);
