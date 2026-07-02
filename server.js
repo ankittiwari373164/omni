@@ -501,7 +501,9 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
       let partImages = [];
       async function makePartImages(p) {
         const parts = groqLib.splitPromptParts(p);
-        if (parts.length < 2 || !client.per_part_images) return [];  // only for split clients with the toggle on
+        // Per-part images run whenever the script actually split into 2+ parts.
+        // Set client.per_part_images = false to explicitly opt out.
+        if (parts.length < 2 || client.per_part_images === false) return [];
         const local = [];
         for (let k = 0; k < parts.length; k++) {
           try {
@@ -939,7 +941,7 @@ app.get("/api/oauth/google/callback", async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
   console.log(`🎬  Flow Studio → http://localhost:${PORT}`);
   const miss = [];
