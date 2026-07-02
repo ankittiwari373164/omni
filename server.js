@@ -155,7 +155,7 @@ app.post("/api/clients/:id/config", upload.fields([
   if (b.chatgpt_link !== undefined) patch.chatgpt_link = b.chatgpt_link || null;
   if (b.prompt_sample !== undefined) patch.prompt_sample = b.prompt_sample || null;
   if (b.split_parts !== undefined) patch.split_parts = b.split_parts === "true" || b.split_parts === true;
-  if (b.gen_part_images !== undefined) patch.gen_part_images = b.gen_part_images === "true" || b.gen_part_images === true;
+  if (b.per_part_images !== undefined) patch.per_part_images = b.per_part_images === "true" || b.per_part_images === true;
   if (b.upload_to_drive !== undefined) patch.upload_to_drive = b.upload_to_drive === "true";
   if (b.drive_folder_id !== undefined) patch.drive_folder_id = b.drive_folder_id || null;
   if (b.upload_to_youtube !== undefined) patch.upload_to_youtube = b.upload_to_youtube === "true";
@@ -483,36 +483,6 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
     const parts = groqLib.splitPromptParts(prompt);
     const videoTitle = (topic && topic.trim()) || deriveTitle(prompt);
 
-    // Per-part reference images: ask ChatGPT to generate one still per part and
-    // paste THAT into Flow for that part. Enabled when the client hasn't opted
-    // out (gen_part_images !== false) and a ChatGPT image server is configured.
-    // Falls back to the client's fixed reference image if generation fails.
-    const wantPartImages = (client.gen_part_images !== false) && !!process.env.CHATGPT_SERVER_URL;
-    const genImageFiles = [];   // ChatGPT-made part images to delete when done
-    const cleanupImages = () => { for (const f of genImageFiles) { try { fs.unlinkSync(f); } catch {} } };
-
-    // Resolve the image to paste for part `i` (whose scene text is `text`).
-    // Returns a file path, or the client's reference image, or null.
-    async function resolvePartImage(i, text) {
-      if (wantPartImages) {
-        try {
-          sendLog(jobId, "progress", `🖼️  Generating image for part ${i + 1} via ChatGPT…`);
-          const outNoExt = path.join(__dirname, "uploads", `partimg_${jobId}_p${i}`);
-          const p = await groqLib.generatePartImage({
-            partText: text, businessName: client.name,
-            businessDetails: client.business_details, chatLink: client.chatgpt_link,
-            outPathNoExt: outNoExt
-          });
-          genImageFiles.push(p);
-          sendLog(jobId, "success", `✅ Part ${i + 1} image ready`);
-          return p;
-        } catch (e) {
-          sendLog(jobId, "warn", `Part ${i + 1} image generation failed (${e.message}); using reference image`);
-        }
-      }
-      return imagePath;   // client's fixed reference image (may be null)
-    }
-
     sendLog(jobId, "info", `🚀 Generating for ${client.name}`);
     sendLog(jobId, "info", `📋 ${prompt.slice(0, 90)}${prompt.length > 90 ? "…" : ""}`);
 
@@ -524,6 +494,39 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
       let currentPrompt = prompt;
       let success = false;
 
+      // Per-part reference images: ask the ChatGPT image server to create ONE
+      // image per part (from that part's scene text), save it locally, and paste
+      // the matching image when generating each part. Falls back to the client's
+      // shared image if a part image can't be made.
+      let partImages = [];
+      async function makePartImages(p) {
+        const parts = groqLib.splitPromptParts(p);
+        if (parts.length < 2 || !client.per_part_images) return [];  // only for split clients with the toggle on
+        const local = [];
+        for (let k = 0; k < parts.length; k++) {
+          try {
+            sendLog(jobId, "progress", `🖼️ Creating image for part ${k + 1}…`);
+            const dataUrl = await groqLib.generateImage(parts[k], client.chatgpt_link);
+            let buf;
+            if (dataUrl.startsWith("data:")) {
+              buf = Buffer.from(dataUrl.split(",")[1], "base64");
+            } else {
+              const r = await fetch(dataUrl);
+              buf = Buffer.from(await r.arrayBuffer());
+            }
+            const fp = path.join(__dirname, "uploads", `partimg_${jobId}_${k}.png`);
+            fs.writeFileSync(fp, buf);
+            local[k] = fp;
+            sendLog(jobId, "success", `✅ Image ready for part ${k + 1}`);
+          } catch (e) {
+            sendLog(jobId, "warn", `Part ${k + 1} image failed (${e.message}) — using client image`);
+            local[k] = null;
+          }
+        }
+        return local;
+      }
+      try { partImages = await makePartImages(currentPrompt); } catch {}
+
       for (let attempt = 1; attempt <= MAX_ATTEMPTS && !success; attempt++) {
         const parts = groqLib.splitPromptParts(currentPrompt);
         if (parts.length > 1) sendLog(jobId, "info", `🧩 Split into ${parts.length} parts`);
@@ -532,8 +535,9 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
 
         for (let i = 0; i < parts.length; i++) {
           if (parts.length > 1) sendLog(jobId, "progress", `🎬 Generating part ${i + 1}/${parts.length}…`);
-          const partImage = await resolvePartImage(i, parts[i]);
-          const res = await generatePart({ jobId, partIndex: i, cookiesPath, profileDir, imagePath: partImage, prompt: parts[i] });
+          // Per-part image if available, else fall back to the client's shared image.
+          const partImg = partImages[i] || imagePath;
+          const res = await generatePart({ jobId, partIndex: i, cookiesPath, profileDir, imagePath: partImg, prompt: parts[i] });
           if (!res.file) { failed = true; policy = res.policy; break; }
           rawFiles.push(res.file);
         }
@@ -564,7 +568,6 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
         sendLog(jobId, "error", `❌ Failed after ${MAX_ATTEMPTS} attempts`);
         try { fs.unlinkSync(cookiesPath); } catch {}
         await supabase.from("videos").update({ status: "error", error: "failed after retries (policy/other)" }).eq("id", videoRow.id);
-        cleanupImages();
         generationBusy = false; if (onComplete) onComplete(false); return;
       }
       try { fs.unlinkSync(cookiesPath); } catch {}
@@ -613,9 +616,7 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
 
       // 4) Drive upload — filename = prompt TITLE (not client name)
       if (client.upload_to_drive) {
-        // Prefer dedicated Drive creds; fall back to the legacy combined token.
-        const driveCol = client.drive_tokens ? "drive_tokens" : (client.youtube_tokens ? "youtube_tokens" : null);
-        const driveTokens = client.drive_tokens || client.youtube_tokens;
+        const driveTokens = client.drive_tokens || client.youtube_tokens; // separate creds, legacy fallback
         if (!driveTokens) {
           sendLog(jobId, "warn", "Drive upload skipped — Drive not connected for this client");
         } else {
@@ -624,22 +625,15 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
             const link = await googleLib.uploadToDrive({
               tokens: driveTokens, filePath: finalFull,
               name: `${videoTitle}.mp4`,
-              folderId: client.drive_folder_id,
-              // Persist auto-refreshed tokens so the credential stays alive.
-              onTokens: (fresh) => {
-                if (driveCol) supabase.from("clients").update({ [driveCol]: fresh }).eq("id", client.id).then(() => {}, () => {});
-              }
+              folderId: client.drive_folder_id
             });
             await supabase.from("videos").update({ drive_url: link }).eq("id", videoRow.id);
             sendLog(jobId, "success", `✅ Drive: ${link}`);
           } catch (e) {
-            if (e.code === "REAUTH") {
-              // Dead refresh token — clear it so the dashboard shows "reconnect".
-              if (driveCol) await supabase.from("clients").update({ [driveCol]: null }).eq("id", client.id);
-              sendLog(jobId, "error", `Drive upload failed: ${e.message}`);
-            } else {
-              sendLog(jobId, "error", `Drive upload failed: ${e.message}`);
-            }
+            const msg = /invalid_grant/i.test(e.message)
+              ? "Drive token expired/revoked — reconnect Drive for this client in Config"
+              : `Drive upload failed: ${e.message}`;
+            sendLog(jobId, "error", msg);
           }
         }
       }
@@ -669,20 +663,17 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
           const yt = await googleLib.uploadToYouTube({
             tokens: client.youtube_tokens, filePath: finalFull,
             title, description, tags,
-            onLog: (m) => sendLog(jobId, "info", m),
-            onTokens: (fresh) => {
-              supabase.from("clients").update({ youtube_tokens: fresh }).eq("id", client.id).then(() => {}, () => {});
-            }
+            onLog: (m) => sendLog(jobId, "info", m)
           });
           await supabase.from("videos").update({
             youtube_url: yt, title, description, hashtags, tags: tags.join(", ")
           }).eq("id", videoRow.id);
           sendLog(jobId, "success", `✅ YouTube: ${yt}`);
         } catch (e) {
-          if (e.code === "REAUTH") {
-            await supabase.from("clients").update({ youtube_tokens: null }).eq("id", client.id);
-          }
-          sendLog(jobId, "error", `YouTube upload failed: ${e.message}`);
+          const msg = /invalid_grant/i.test(e.message)
+            ? "YouTube token expired/revoked — reconnect YouTube for this client in Config"
+            : `YouTube upload failed: ${e.message}`;
+          sendLog(jobId, "error", msg);
         }
       } else if (client.upload_to_youtube) {
         sendLog(jobId, "warn", "YouTube upload skipped — channel not connected (Configure YouTube)");
@@ -692,14 +683,12 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
       if (videoRow.calendar_item_id)
         await supabase.from("calendar_items").update({ status: "done" }).eq("id", videoRow.calendar_item_id);
       sendLog(jobId, "success", "🏁 Done");
-      cleanupImages();
       generationBusy = false;
       if (onComplete) onComplete(true);
     } catch (e) {
       sendLog(jobId, "error", `Pipeline error: ${e.message}`);
       try { fs.unlinkSync(cookiesPath); } catch {}
       await supabase.from("videos").update({ status: "error", error: e.message }).eq("id", videoRow.id);
-      cleanupImages();
       generationBusy = false;
       if (onComplete) onComplete(false);
     }
@@ -926,16 +915,7 @@ app.get("/api/oauth/google/callback", async (req, res) => {
     const { code, state } = req.query;
     // state is either "<clientId>" (legacy combined) or "<clientId>::<service>".
     const [clientId, service] = String(state || "").split("::");
-    // Load whatever tokens we already stored so we can carry the refresh_token
-    // forward — Google only returns it on the first consent.
-    const { data: existing } = await supabase.from("clients")
-      .select("drive_tokens, youtube_tokens").eq("id", clientId).single();
-    const prevTokens = service === "drive"
-      ? (existing?.drive_tokens)
-      : service === "youtube"
-        ? (existing?.youtube_tokens)
-        : (existing?.youtube_tokens || existing?.drive_tokens);
-    const { tokens, channelName } = await googleLib.exchangeCode(code, prevTokens);
+    const { tokens, channelName } = await googleLib.exchangeCode(code);
 
     let patch, label;
     if (service === "drive") {
