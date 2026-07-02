@@ -506,7 +506,7 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
         for (let k = 0; k < parts.length; k++) {
           try {
             sendLog(jobId, "progress", `🖼️ Creating image for part ${k + 1}…`);
-            const dataUrl = await groqLib.generateImage(parts[k], client.chatgpt_link);
+            const dataUrl = await groqLib.generateImage(parts[k], "");  // fresh blank chat for images
             let buf;
             if (dataUrl.startsWith("data:")) {
               buf = Buffer.from(dataUrl.split(",")[1], "base64");
