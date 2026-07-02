@@ -473,6 +473,7 @@ function generatePart({ jobId, partIndex, cookiesPath, profileDir, imagePath, pr
 function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, topic, onComplete }) {
   generationBusy = true;
   (async () => {
+    sendLog(jobId, "info", `🧭 pipeline build: PER-PART-IMAGES v4 — file: ${__filename}`);
     const outDir = path.join(__dirname, "outputs");
     // Per-client persistent Chrome profile (logged in once via login-once.js).
     // If it exists, generation uses it (no cookie expiry). Else falls back to cookies.
@@ -501,9 +502,12 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
       let partImages = [];
       async function makePartImages(p) {
         const parts = groqLib.splitPromptParts(p);
-        // Per-part images run whenever the script actually split into 2+ parts.
-        // Set client.per_part_images = false to explicitly opt out.
-        if (parts.length < 2 || client.per_part_images === false) return [];
+        sendLog(jobId, "info", `🧪 Per-part images: detected ${parts.length} part(s)`);
+        if (parts.length < 2) return [];   // only split (2+ part) videos need per-part images
+        if (!process.env.CHATGPT_SERVER_URL) {
+          sendLog(jobId, "warn", "CHATGPT_SERVER_URL not set — skipping per-part images, using client image");
+          return [];
+        }
         const local = [];
         for (let k = 0; k < parts.length; k++) {
           try {
@@ -527,7 +531,11 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
         }
         return local;
       }
-      try { partImages = await makePartImages(currentPrompt); } catch {}
+      try {
+        partImages = await makePartImages(currentPrompt);
+      } catch (e) {
+        sendLog(jobId, "warn", `Per-part image step error: ${e.message}`);
+      }
 
       for (let attempt = 1; attempt <= MAX_ATTEMPTS && !success; attempt++) {
         const parts = groqLib.splitPromptParts(currentPrompt);
