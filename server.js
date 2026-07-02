@@ -153,6 +153,7 @@ app.post("/api/clients/:id/config", upload.fields([
   if (b.name !== undefined) patch.name = b.name;
   if (b.business_details !== undefined) patch.business_details = b.business_details;
   if (b.chatgpt_link !== undefined) patch.chatgpt_link = b.chatgpt_link || null;
+  if (b.image_chat_link !== undefined) patch.image_chat_link = b.image_chat_link || null;
   if (b.prompt_sample !== undefined) patch.prompt_sample = b.prompt_sample || null;
   if (b.split_parts !== undefined) patch.split_parts = b.split_parts === "true" || b.split_parts === true;
   if (b.per_part_images !== undefined) patch.per_part_images = b.per_part_images === "true" || b.per_part_images === true;
@@ -512,7 +513,7 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
         for (let k = 0; k < parts.length; k++) {
           try {
             sendLog(jobId, "progress", `🖼️ Creating image for part ${k + 1}…`);
-            const dataUrl = await groqLib.generateImage(parts[k], "");  // fresh blank chat for images
+            const dataUrl = await groqLib.generateImage(parts[k], client.image_chat_link || "");  // this client's image chat (blank = fresh chat)
             let buf;
             if (dataUrl.startsWith("data:")) {
               buf = Buffer.from(dataUrl.split(",")[1], "base64");
