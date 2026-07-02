@@ -738,7 +738,7 @@ function waitUntilFree(timeoutMs = 20 * 60 * 1000) {
     const start = Date.now();
     const t = setInterval(() => {
       if (!generationBusy || Date.now() - start > timeoutMs) { clearInterval(t); resolve(); }
-    }, 3000);
+    }, 3001);
   });
 }
 
