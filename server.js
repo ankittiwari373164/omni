@@ -627,24 +627,28 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
 
       // 4) Drive upload — filename = prompt TITLE (not client name)
       if (client.upload_to_drive) {
-        const driveTokens = client.drive_tokens || client.youtube_tokens; // separate creds, legacy fallback
-        if (!driveTokens) {
-          sendLog(jobId, "warn", "Drive upload skipped — Drive not connected for this client");
+        // GLOBAL Drive: one connection for the whole dashboard, stored in settings.
+        const driveTokens = await getSetting("drive_tokens");
+        if (!driveTokens || !driveTokens.refresh_token) {
+          sendLog(jobId, "warn", "Drive upload skipped — global Drive not connected (Connect Drive in the dashboard)");
         } else {
           try {
             sendLog(jobId, "progress", "☁️  Uploading to Google Drive…");
             const link = await googleLib.uploadToDrive({
               tokens: driveTokens, filePath: finalFull,
               name: `${videoTitle}.mp4`,
-              folderId: client.drive_folder_id
+              folderId: client.drive_folder_id,   // per-client target folder in the shared Drive
+              onTokens: (fresh) => { setSetting("drive_tokens", fresh).catch(() => {}); }
             });
             await supabase.from("videos").update({ drive_url: link }).eq("id", videoRow.id);
             sendLog(jobId, "success", `✅ Drive: ${link}`);
           } catch (e) {
-            const msg = /invalid_grant/i.test(e.message)
-              ? "Drive token expired/revoked — reconnect Drive for this client in Config"
-              : `Drive upload failed: ${e.message}`;
-            sendLog(jobId, "error", msg);
+            if (e.code === "REAUTH") {
+              await setSetting("drive_tokens", null);   // dead token → force global reconnect
+              sendLog(jobId, "error", "Drive upload failed — global Drive disconnected (reconnect it in the dashboard)");
+            } else {
+              sendLog(jobId, "error", `Drive upload failed: ${e.message}`);
+            }
           }
         }
       }
@@ -904,7 +908,31 @@ app.post("/api/clients/:id/drive/disconnect", async (req, res) => {
 });
 
 // ====================================================================
-//  GOOGLE OAUTH (Drive + YouTube) — per client
+//  GLOBAL SETTINGS (key/value) — used for the ONE shared Drive connection
+// ====================================================================
+async function getSetting(key) {
+  const { data } = await supabase.from("settings").select("value").eq("key", key).maybeSingle();
+  return data ? data.value : null;
+}
+async function setSetting(key, value) {
+  await supabase.from("settings").upsert({ key, value, updated_at: new Date().toISOString() });
+}
+
+// Global Drive: status, connect, disconnect (one Drive account for all clients).
+app.get("/api/settings/drive", async (req, res) => {
+  const t = await getSetting("drive_tokens");
+  res.json({ connected: !!(t && t.refresh_token) });
+});
+app.get("/api/oauth/drive-global/start", (req, res) => {
+  res.redirect(googleLib.getServiceAuthUrl("__global__::drive", "drive"));
+});
+app.post("/api/settings/drive/disconnect", async (req, res) => {
+  await setSetting("drive_tokens", null);
+  res.json({ ok: true });
+});
+
+// ====================================================================
+//  GOOGLE OAUTH (Drive = global · YouTube = per client)
 // ====================================================================
 app.get("/api/oauth/google/start", (req, res) => {
   const clientId = req.query.client_id;
@@ -912,31 +940,49 @@ app.get("/api/oauth/google/start", (req, res) => {
   res.redirect(googleLib.getAuthUrl(clientId));
 });
 
-// Separate per-service connect flows. service = "youtube" | "drive".
+// Per-service connect flow. service = "youtube" | "drive".
+// (Drive here is kept for backward compatibility but the pipeline now uses the
+//  GLOBAL Drive connection; prefer /api/oauth/drive-global/start.)
 app.get("/api/oauth/:service/start", (req, res) => {
   const clientId = req.query.client_id;
   const service = req.params.service;
   if (!clientId) return res.status(400).send("client_id required");
   if (service !== "youtube" && service !== "drive") return res.status(400).send("bad service");
-  res.redirect(googleLib.getServiceAuthUrl(clientId, service));
+  res.redirect(googleLib.getServiceAuthUrl(`${clientId}::${service}`, service));
 });
 
 app.get("/api/oauth/google/callback", async (req, res) => {
   try {
     const { code, state } = req.query;
-    // state is either "<clientId>" (legacy combined) or "<clientId>::<service>".
+    // state is "<clientId>", "<clientId>::<service>", or "__global__::drive".
     const [clientId, service] = String(state || "").split("::");
-    const { tokens, channelName } = await googleLib.exchangeCode(code);
+
+    // GLOBAL Drive connection → store in settings, not on a client.
+    if (clientId === "__global__" && service === "drive") {
+      const prev = await getSetting("drive_tokens");
+      const { tokens } = await googleLib.exchangeCode(code, prev);
+      await setSetting("drive_tokens", tokens);
+      return res.send(`<html><body style="font-family:sans-serif;background:#0a0a0f;color:#e8e8f0;padding:40px">
+        ✅ Google Drive connected (global). You can close this tab and return to Flow Studio.
+        <script>setTimeout(()=>window.close(),1500)</script></body></html>`);
+    }
+
+    // Per-client: carry old refresh_token forward on re-consent.
+    const { data: existing } = await supabase.from("clients")
+      .select("youtube_tokens, drive_tokens").eq("id", clientId).maybeSingle();
+    const prevTokens = service === "youtube" ? existing?.youtube_tokens
+                     : service === "drive" ? existing?.drive_tokens
+                     : (existing?.youtube_tokens || existing?.drive_tokens);
+    const { tokens, channelName } = await googleLib.exchangeCode(code, prevTokens);
 
     let patch, label;
     if (service === "drive") {
       patch = { drive_tokens: tokens };
-      label = "Google Drive";
+      label = "Google Drive (this client)";
     } else if (service === "youtube") {
       patch = { youtube_tokens: tokens, youtube_channel: channelName || null };
       label = channelName ? `YouTube (${channelName})` : "YouTube";
     } else {
-      // legacy combined connect — populate BOTH so old flow still works
       patch = { youtube_tokens: tokens, drive_tokens: tokens, youtube_channel: channelName || null };
       label = channelName ? `Google (${channelName})` : "Google";
     }
