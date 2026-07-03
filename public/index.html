@@ -117,6 +117,20 @@
     </div>
     <div class="sb-head"><span>Clients</span><button class="sb-add" onclick="addClient()" title="Add client">+</button></div>
     <div class="client-list" id="clientList"><div class="sb-empty">No clients yet.<br>Click + to add one.</div></div>
+    <div style="margin-top:auto;padding:12px;border-top:1px solid var(--border)">
+      <div style="display:flex;align-items:center;gap:8px">
+        <div style="font-size:18px">📁</div>
+        <div style="flex:1;min-width:0">
+          <div style="font-size:12px;font-weight:600">Google Drive (global)</div>
+          <div id="globalDriveStatus" class="hint" style="font-size:11px">Checking…</div>
+        </div>
+      </div>
+      <div style="display:flex;gap:6px;margin-top:8px">
+        <button class="btn btn-sm" id="globalDriveConnectBtn" style="flex:1;justify-content:center" onclick="connectGlobalDrive()">Connect Drive</button>
+        <button class="btn btn-sm" id="globalDriveDisconnectBtn" style="display:none;color:var(--red)" onclick="disconnectGlobalDrive()">Disconnect</button>
+      </div>
+      <div class="hint" style="font-size:10px;margin-top:6px">One Drive account for all clients. Each client picks its own folder below.</div>
+    </div>
   </aside>
 
   <!-- Main -->
@@ -154,17 +168,7 @@
       <button class="btn btn-sm" id="ytDisconnectBtn" style="color:var(--red);display:none" onclick="disconnectYoutube()">Disconnect</button>
     </div>
     <button class="btn btn-primary" style="width:100%;justify-content:center" onclick="connectYoutube()">Connect YouTube (Google sign-in)</button>
-
-    <div class="yt-conn" style="margin-top:16px">
-      <div class="ic">📁</div>
-      <div style="flex:1">
-        <div style="font-size:13px;font-weight:600">Drive connection</div>
-        <div id="driveConnValue" class="hint">Not connected</div>
-      </div>
-      <button class="btn btn-sm" id="driveDisconnectBtn" style="color:var(--red);display:none" onclick="disconnectDrive()">Disconnect</button>
-    </div>
-    <button class="btn btn-primary" style="width:100%;justify-content:center" onclick="connectDrive()">Connect Drive (Google sign-in)</button>
-    <div class="hint" style="margin-top:6px">Each connects its own Google account. Uploads publish <b>Public</b> · <b>Not made for kids</b>. You can use different accounts for YouTube and Drive.</div>
+    <div class="hint" style="margin-top:6px">Each client connects its own YouTube account. Uploads publish <b>Public</b> · <b>Not made for kids</b>. Google Drive is a single global connection (set it in the sidebar).</div>
 
     <div style="height:1px;background:var(--border);margin:18px 0"></div>
 
@@ -389,19 +393,32 @@ function openYoutubeModal(){
     ? '<span style="color:var(--green)">Connected'+(c.youtube_channel?': '+esc(c.youtube_channel):'')+'</span>'
     : 'Not connected';
   $("ytDisconnectBtn").style.display = connected ? "inline-flex" : "none";
-  const driveConnected = !!c.drive_tokens;
-  if($("driveConnValue")) $("driveConnValue").innerHTML = driveConnected
-    ? '<span style="color:var(--green)">Connected</span>' : 'Not connected';
-  if($("driveDisconnectBtn")) $("driveDisconnectBtn").style.display = driveConnected ? "inline-flex" : "none";
   $("ytModal").classList.add("show");
 }
 function connectYoutube(){
   window.open("/api/oauth/youtube/start?client_id="+currentClient.id, "_blank", "width=520,height=640");
   toast("Finish YouTube sign-in, then reopen this panel.");
 }
-function connectDrive(){
-  window.open("/api/oauth/drive/start?client_id="+currentClient.id, "_blank", "width=520,height=640");
-  toast("Finish Drive sign-in, then reopen this panel.");
+function connectGlobalDrive(){
+  window.open("/api/oauth/drive-global/start", "_blank", "width=520,height=640");
+  toast("Finish Drive sign-in in the popup, then it applies to all clients.");
+  // Re-check status a few times after the popup flow.
+  let n=0; const t=setInterval(async()=>{ n++; await loadGlobalDrive(); if(n>=6) clearInterval(t); }, 2500);
+}
+async function disconnectGlobalDrive(){
+  if(!confirm("Disconnect the global Google Drive? All clients will stop uploading to Drive.")) return;
+  try{ await api("/api/settings/drive/disconnect",{method:"POST"}); await loadGlobalDrive(); toast("Drive disconnected"); }
+  catch(e){ toast("Error: "+e.message); }
+}
+async function loadGlobalDrive(){
+  try{
+    const s = await api("/api/settings/drive");
+    const on = !!s.connected;
+    $("globalDriveStatus").innerHTML = on
+      ? '<span style="color:var(--green)">Connected</span>' : 'Not connected';
+    $("globalDriveConnectBtn").style.display = on ? "none" : "inline-flex";
+    $("globalDriveDisconnectBtn").style.display = on ? "inline-flex" : "none";
+  }catch(e){ $("globalDriveStatus").textContent = "Status unavailable"; }
 }
 async function disconnectYoutube(){
   if(!confirm("Disconnect this client's YouTube account?")) return;
@@ -409,14 +426,6 @@ async function disconnectYoutube(){
     await api("/api/clients/"+currentClient.id+"/youtube/disconnect",{method:"POST"});
     currentClient = await api("/api/clients/"+currentClient.id);
     openYoutubeModal(); toast("YouTube disconnected");
-  }catch(e){ toast("Error: "+e.message); }
-}
-async function disconnectDrive(){
-  if(!confirm("Disconnect this client's Drive account?")) return;
-  try{
-    await api("/api/clients/"+currentClient.id+"/drive/disconnect",{method:"POST"});
-    currentClient = await api("/api/clients/"+currentClient.id);
-    openYoutubeModal(); toast("Drive disconnected");
   }catch(e){ toast("Error: "+e.message); }
 }
 async function saveYoutubeConfig(){
@@ -659,6 +668,7 @@ async function renderVideos(){
 }
 
 loadClients();
+loadGlobalDrive();
 </script>
 </body>
 </html>
