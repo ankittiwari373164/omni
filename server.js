@@ -430,12 +430,13 @@ function deriveTitle(prompt) {
 }
 
 // Generate ONE clip for a single prompt part. Resolves to the raw filename or null.
-function generatePart({ jobId, partIndex, cookiesPath, profileDir, imagePath, prompt }) {
+function generatePart({ jobId, partIndex, cookiesPath, profileDir, imagePath, imagePaths, prompt }) {
   return new Promise((resolve) => {
     const partJob = `${jobId}_p${partIndex}`;
     const scriptPath = path.join(__dirname, "uploads", `script_${partJob}.js`);
     fs.writeFileSync(scriptPath, buildScript({
-      cookiesPath, profileDir, imagePath,
+      cookiesPath, profileDir,
+      imagePaths: imagePaths || (imagePath ? [imagePath] : []),
       prompt: String(prompt).replace(/\s*\n+\s*/g, " ").trim(),
       aspectRatio: "9:16", speed: "1x", duration: "10s", jobId: partJob
     }));
@@ -546,9 +547,11 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
 
         for (let i = 0; i < parts.length; i++) {
           if (parts.length > 1) sendLog(jobId, "progress", `🎬 Generating part ${i + 1}/${parts.length}…`);
-          // Per-part image if available, else fall back to the client's shared image.
-          const partImg = partImages[i] || imagePath;
-          const res = await generatePart({ jobId, partIndex: i, cookiesPath, profileDir, imagePath: partImg, prompt: parts[i] });
+          // Paste BOTH the per-part generated image AND the client's reference
+          // image into Flow (per-part first as the frame, reference as anchor).
+          const imgs = [...new Set([partImages[i], imagePath].filter(Boolean))];
+          if (imgs.length) sendLog(jobId, "info", `🖼️ Part ${i + 1}: pasting ${imgs.length} image(s) into Flow`);
+          const res = await generatePart({ jobId, partIndex: i, cookiesPath, profileDir, imagePaths: imgs, prompt: parts[i] });
           if (!res.file) { failed = true; policy = res.policy; break; }
           rawFiles.push(res.file);
         }
