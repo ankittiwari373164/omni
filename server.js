@@ -808,7 +808,105 @@ app.post("/api/clients/:id/rss/fetch", async (req, res) => {
   }
 });
 
-// Daily scheduler: for each RSS client, ingest newest articles and auto-generate
+// A client can generate if it has a persistent login profile OR legacy cookies.
+function clientHasSession(client) {
+  const hasProfile = fs.existsSync(path.join(__dirname, "profiles", String(client.id)));
+  return hasProfile || !!client.cookies;
+}
+
+// Pick ONE fresh, unique news item PER configured category (plus one from any
+// custom feeds), skipping anything this client has ever used before. Returns
+// [{ title, summary, link, isoDate, _category }].
+async function pickDailyNews(client) {
+  // Every link this client has ever queued/produced — so news never repeats.
+  const { data: existing } = await supabase.from("calendar_items")
+    .select("link").eq("client_id", client.id).not("link", "is", null);
+  const used = new Set((existing || []).map(e => e.link));
+
+  const cats = String(client.rss_categories || "").split(",").map(s => s.trim()).filter(Boolean);
+  const chosen = [];
+  const pickedLinks = new Set();
+
+  const takeOne = async (feedList, categoryLabel) => {
+    const feedsStr = Array.isArray(feedList) ? feedList.join("\n") : String(feedList || "");
+    if (!feedsStr.trim()) return;
+    let items = [];
+    try { items = await rssLib.fetchFeeds(feedsStr, 15); } catch (e) { console.log(`  feed error [${categoryLabel}]: ${e.message}`); }
+    const pick = items.find(i => i.link && !used.has(i.link) && !pickedLinks.has(i.link));
+    if (pick) { pick._category = categoryLabel; chosen.push(pick); pickedLinks.add(pick.link); }
+  };
+
+  // One unique article per category.
+  for (const cat of cats) {
+    await takeOne(feedsLib.feedsForCategories([cat]), cat);
+  }
+  // One from custom feeds, if any.
+  const custom = rssLib.feedUrls(client.rss_feeds);
+  if (custom && custom.length) await takeOne(custom, "custom");
+
+  // Optional per-day cap (safety). 0/blank = one per category (all).
+  const cap = client.rss_daily_limit && client.rss_daily_limit > 0 ? client.rss_daily_limit : chosen.length;
+  return chosen.slice(0, cap);
+}
+
+// Generate ONE news video end-to-end (prompt → video → YouTube upload w/ meta).
+async function generateNewsItem(client, it, dateStr) {
+  let ci = null;
+  try {
+    const ins = await supabase.from("calendar_items").insert({
+      client_id: client.id, topic: it.title, hook: it.summary, link: it.link,
+      source: "rss", scheduled_date: dateStr, status: "generating"
+    }).select().single();
+    ci = ins.data;
+
+    const prompt = await groqLib.generateNewsPrompt({
+      businessName: client.name, businessDetails: client.business_details, chatLink: client.chatgpt_link,
+      title: it.title, summary: it.summary
+    });
+    await supabase.from("calendar_items").update({ prompt }).eq("id", ci.id);
+
+    if (process.env.DASHBOARD_ONLY === "1") {
+      await supabase.from("calendar_items").update({ status: "prompt_ready" }).eq("id", ci.id);
+      return;
+    }
+
+    await waitUntilFree();
+    // generateOne → runPipeline handles concat/composite AND the YouTube upload
+    // with ChatGPT-generated title/description/tags/hashtags.
+    await generateOne({ client, prompt, topic: it.title, calItemId: ci.id, link: it.link });
+  } catch (articleErr) {
+    console.log(`  ✗ RSS article failed (${client.name}): ${articleErr.message}`);
+    if (ci?.id) {
+      await supabase.from("calendar_items").update({ status: "error", error: articleErr.message }).eq("id", ci.id);
+    } else {
+      await supabase.from("calendar_items").insert({
+        client_id: client.id, topic: it.title, link: it.link, source: "rss",
+        scheduled_date: dateStr, status: "error", error: articleErr.message
+      });
+    }
+  }
+}
+
+// Manual trigger: generate today's per-category news for ONE client right now
+// (ignores the once-a-day guard). Handy for testing without waiting.
+app.post("/api/clients/:id/rss/run-now", async (req, res) => {
+  const { data: client } = await supabase.from("clients").select("*").eq("id", req.params.id).single();
+  if (!client) return res.status(404).json({ error: "client not found" });
+  if (!clientHasSession(client)) return res.status(400).json({ error: "no login profile — run: node login-once.js " + client.id });
+  if (!clientFeeds(client)) return res.status(400).json({ error: "no RSS categories or feeds configured" });
+  res.json({ ok: true, message: "RSS run started — watch the server logs and the client's calendar." });
+  (async () => {
+    const today = new Date().toISOString().slice(0, 10);
+    try {
+      const fresh = await pickDailyNews(client);
+      console.log(`📰 [run-now] RSS [${client.name}] ${fresh.length} unique article(s)`);
+      for (const it of fresh) await generateNewsItem(client, it, today);
+      await supabase.from("clients").update({ last_rss_run: today }).eq("id", client.id);
+    } catch (e) { console.log(`[run-now] error (${client.name}): ${e.message}`); }
+  })();
+});
+
+// Daily scheduler: for each RSS client, pick unique per-category news & auto-generate
 async function runRssScheduler() {
   const today = new Date().toISOString().slice(0, 10);
   let clients;
@@ -820,55 +918,14 @@ async function runRssScheduler() {
   for (const client of clients) {
     if (client.last_rss_run === today) continue;        // already ran today
     const feeds = clientFeeds(client);
-    if (!client.cookies || !feeds) continue;            // not ready
-
+    if (!clientHasSession(client) || !feeds) {
+      if (!clientHasSession(client)) console.log(`⏭️  RSS [${client.name}] skipped — no login profile (run: node login-once.js ${client.id})`);
+      continue;
+    }
     try {
-      const items = await rssLib.fetchFeeds(feeds, 20);
-      const { data: existing } = await supabase.from("calendar_items")
-        .select("link").eq("client_id", client.id).not("link", "is", null)
-        .in("status", ["done", "uploaded", "generating"]);
-      const have = new Set((existing || []).map(e => e.link));
-      const fresh = items.filter(i => !have.has(i.link)).slice(0, client.rss_daily_limit || 3);
-
-      console.log(`📰 RSS [${client.name}] ${fresh.length} new article(s) to generate`);
-      for (const it of fresh) {
-        let ci = null;
-        try {
-          const ins = await supabase.from("calendar_items").insert({
-            client_id: client.id, topic: it.title, hook: it.summary, link: it.link,
-            source: "rss", scheduled_date: today, status: "generating"
-          }).select().single();
-          ci = ins.data;
-
-          const prompt = await groqLib.generateNewsPrompt({
-            businessName: client.name, businessDetails: client.business_details, chatLink: client.chatgpt_link,
-            title: it.title, summary: it.summary
-          });
-          await supabase.from("calendar_items").update({ prompt }).eq("id", ci.id);
-
-          if (process.env.DASHBOARD_ONLY === "1") {
-            await supabase.from("calendar_items").update({ status: "prompt_ready" }).eq("id", ci.id);
-            continue;
-          }
-
-          await waitUntilFree();
-          await generateOne({ client, prompt, topic: it.title, calItemId: ci.id, link: it.link });
-        } catch (articleErr) {
-          // Mark this item as error so it is NOT retried forever (its link is
-          // now recorded, so it won't be picked up as "fresh" again).
-          console.log(`  ✗ RSS article failed (${client.name}): ${articleErr.message}`);
-          if (ci?.id) {
-            await supabase.from("calendar_items").update({ status: "error", error: articleErr.message }).eq("id", ci.id);
-          } else {
-            // insert failed — record the link so we don't loop on it
-            await supabase.from("calendar_items").insert({
-              client_id: client.id, topic: it.title, link: it.link, source: "rss",
-              scheduled_date: today, status: "error", error: articleErr.message
-            });
-          }
-        }
-      }
-      // Always record the run so the scheduler doesn't immediately re-run.
+      const fresh = await pickDailyNews(client);
+      console.log(`📰 RSS [${client.name}] ${fresh.length} unique article(s) across categories`);
+      for (const it of fresh) await generateNewsItem(client, it, today);
       await supabase.from("clients").update({ last_rss_run: today }).eq("id", client.id);
     } catch (e) {
       console.log(`RSS scheduler error for ${client.name}:`, e.message);
