@@ -861,7 +861,7 @@ async function generateNewsItem(client, it, dateStr) {
 
     const prompt = await groqLib.generateNewsPrompt({
       businessName: client.name, businessDetails: client.business_details, chatLink: client.chatgpt_link,
-      title: it.title, summary: it.summary
+      title: it.title, summary: it.summary, splitParts: client.split_parts
     });
     await supabase.from("calendar_items").update({ prompt }).eq("id", ci.id);
 
