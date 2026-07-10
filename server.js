@@ -266,17 +266,7 @@ app.post("/api/calendar/:itemId/prompt", async (req, res) => {
     if (!item) return res.status(404).json({ error: "item not found" });
     const { data: client } = await supabase.from("clients").select("*").eq("id", item.client_id).single();
 
-    const prompt = item.source === "rss"
-      ? await groqLib.generateNewsPrompt({
-          businessName: client.name, businessDetails: client.business_details, chatLink: client.chatgpt_link,
-          title: item.topic, summary: item.hook
-        })
-      : await groqLib.generatePrompt({
-          businessName: client.name, businessDetails: client.business_details, chatLink: client.chatgpt_link,
-          topic: item.topic, hook: item.hook,
-          styleKey: client.prompt_style, styleInstruction: client.prompt_custom,
-              promptSample: client.prompt_sample, splitParts: client.split_parts
-        });
+    const prompt = await promptForItem(client, item);
 
     const { data, error } = await supabase.from("calendar_items")
       .update({ prompt, status: "prompt_ready" }).eq("id", item.id).select().single();
@@ -330,17 +320,7 @@ app.post("/api/clients/:id/generate", upload.fields([{ name: "image", maxCount: 
       prompt = item?.prompt;
       topic = item?.topic || topic;
       if (!prompt) {
-        prompt = item.source === "rss"
-          ? await groqLib.generateNewsPrompt({
-              businessName: client.name, businessDetails: client.business_details, chatLink: client.chatgpt_link,
-              title: item.topic, summary: item.hook
-            })
-          : await groqLib.generatePrompt({
-              businessName: client.name, businessDetails: client.business_details, chatLink: client.chatgpt_link,
-              topic: item.topic, hook: item.hook,
-              styleKey: client.prompt_style, styleInstruction: client.prompt_custom,
-                  promptSample: client.prompt_sample, splitParts: client.split_parts
-            });
+        prompt = await promptForItem(client, item);
         await supabase.from("calendar_items").update({ prompt, status: "prompt_ready" }).eq("id", calItemId);
       }
     }
@@ -936,6 +916,174 @@ async function runRssScheduler() {
 // check hourly; also once ~30s after startup
 setInterval(() => runRssScheduler().catch(e => console.log("RSS scheduler:", e.message)), 60 * 60 * 1000);
 setTimeout(() => runRssScheduler().catch(() => {}), 30 * 1000);
+
+// ====================================================================
+//  PROMPT RESOLUTION for a calendar item
+//   • user_prompt present (Excel upload) → enhancePrompt (keep wording, reformat+split)
+//   • source "rss"                       → generateNewsPrompt (theme-safe, split)
+//   • otherwise                          → generatePrompt (house calendar format)
+// ====================================================================
+async function promptForItem(client, item) {
+  if (item.user_prompt && String(item.user_prompt).trim()) {
+    return groqLib.enhancePrompt({
+      userPrompt: item.user_prompt,
+      businessName: client.name, businessDetails: client.business_details,
+      splitParts: client.split_parts, chatLink: client.chatgpt_link
+    });
+  }
+  if (item.source === "rss") {
+    return groqLib.generateNewsPrompt({
+      businessName: client.name, businessDetails: client.business_details, chatLink: client.chatgpt_link,
+      title: item.topic, summary: item.hook, splitParts: client.split_parts
+    });
+  }
+  return groqLib.generatePrompt({
+    businessName: client.name, businessDetails: client.business_details, chatLink: client.chatgpt_link,
+    topic: item.topic, hook: item.hook,
+    styleKey: client.prompt_style, styleInstruction: client.prompt_custom,
+    promptSample: client.prompt_sample, splitParts: client.split_parts
+  });
+}
+
+// ====================================================================
+//  EXCEL CALENDAR IMPORT (per client)
+//  Upload an .xlsx whose rows already contain the PROMPT you wrote. It REPLACES
+//  the client's current calendar (keeps items already done/generating/uploaded).
+//  At generation time each row's prompt is sent to ChatGPT to be ENHANCED +
+//  SPLIT (not rewritten), and per-part images are generated.
+//
+//  Accepted columns (header row, case-insensitive; extra columns ignored):
+//    prompt   (required) — the full prompt you want used
+//    date     (optional) — YYYY-MM-DD; blank = auto sequential from today
+//    topic    (optional) — short label / title
+//    hook     (optional) — one-line angle
+// ====================================================================
+app.post("/api/clients/:id/calendar/import-xlsx", upload.single("file"), async (req, res) => {
+  try {
+    const { data: client } = await supabase.from("clients").select("id,name").eq("id", req.params.id).single();
+    if (!client) return res.status(404).json({ error: "client not found" });
+    if (!req.file) return res.status(400).json({ error: "no file uploaded (field name must be 'file')" });
+
+    let XLSX;
+    try { XLSX = require("xlsx"); }
+    catch { return res.status(500).json({ error: "The 'xlsx' package isn't installed. Run: npm install xlsx" }); }
+
+    const wb = XLSX.readFile(req.file.path);
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const raw = XLSX.utils.sheet_to_json(ws, { defval: "" });
+    try { fs.unlinkSync(req.file.path); } catch {}
+
+    // Tolerant header mapping (case/spacing-insensitive).
+    const norm = k => String(k).toLowerCase().replace(/[^a-z0-9]/g, "");
+    const pick = (row, names) => {
+      for (const key of Object.keys(row)) {
+        if (names.includes(norm(key))) return row[key];
+      }
+      return "";
+    };
+
+    const today = new Date();
+    const rows = [];
+    let seq = 0;
+    for (const r of raw) {
+      const promptText = String(pick(r, ["prompt", "videoprompt", "script"]) || "").trim();
+      if (!promptText) continue;   // skip rows without a prompt
+      const topic = String(pick(r, ["topic", "title", "idea"]) || "").trim();
+      const hook = String(pick(r, ["hook", "angle"]) || "").trim();
+      let dateStr = String(pick(r, ["date", "scheduleddate", "day"]) || "").trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+        const d = new Date(today); d.setDate(today.getDate() + seq);
+        dateStr = d.toISOString().slice(0, 10);
+      }
+      rows.push({
+        client_id: client.id,
+        topic: topic || `Video ${seq + 1}`,
+        hook,
+        user_prompt: promptText,
+        prompt: null,
+        source: "excel",
+        scheduled_date: dateStr,
+        status: "planned"
+      });
+      seq++;
+    }
+
+    if (!rows.length) return res.status(400).json({ error: "No rows with a 'prompt' column were found in the sheet." });
+
+    // Override current calendar: drop items not yet produced; keep done/generating/uploaded.
+    await supabase.from("calendar_items").delete()
+      .eq("client_id", client.id).in("status", ["planned", "prompt_ready", "error"]);
+    const { data, error } = await supabase.from("calendar_items").insert(rows).select();
+    if (error) return res.status(500).json({ error: error.message });
+
+    res.json({ ok: true, imported: data.length, message: `Imported ${data.length} calendar item(s) with your prompts.` });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ====================================================================
+//  AFTERNOON RETRY (second daily pass ~3 PM)
+//  Finds today's calendar items whose video did NOT generate (status "error",
+//  or "generating" that got stuck) and re-runs them. Runs once per day when the
+//  local hour is >= RETRY_HOUR. Also exposed manually for testing.
+// ====================================================================
+const RETRY_HOUR = parseInt(process.env.RETRY_HOUR || "15", 10);   // 15 = 3 PM local
+let lastRetryDate = null;
+
+async function retryFailedForToday() {
+  if (generationBusy) { console.log("↩︎ retry: generation busy, will try later"); return; }
+  const today = new Date().toISOString().slice(0, 10);
+
+  // Items that were supposed to run today but didn't succeed.
+  const { data: items } = await supabase.from("calendar_items")
+    .select("*").eq("scheduled_date", today).in("status", ["error", "generating"]);
+  if (!items || !items.length) { console.log("↩︎ retry: nothing to retry"); return; }
+
+  console.log(`↩︎ Afternoon retry: ${items.length} item(s) to re-attempt`);
+  const clientCache = {};
+  for (const item of items) {
+    try {
+      let client = clientCache[item.client_id];
+      if (!client) {
+        const { data: c } = await supabase.from("clients").select("*").eq("id", item.client_id).single();
+        client = clientCache[item.client_id] = c;
+      }
+      if (!client) continue;
+      if (!clientHasSession(client)) { console.log(`  ⏭️ ${client.name}: no login profile`); continue; }
+
+      // Mark any stuck video rows for this item as error so they don't linger.
+      await supabase.from("videos").update({ status: "error", error: "superseded by afternoon retry" })
+        .eq("calendar_item_id", item.id).in("status", ["generating"]);
+
+      const prompt = (item.prompt && item.prompt.trim()) ? item.prompt : await promptForItem(client, item);
+      await supabase.from("calendar_items").update({ status: "generating", prompt, error: null }).eq("id", item.id);
+
+      await waitUntilFree();
+      await generateOne({ client, prompt, topic: item.topic, calItemId: item.id, link: item.link });
+    } catch (e) {
+      console.log(`  ✗ retry failed for item ${item.id}: ${e.message}`);
+      await supabase.from("calendar_items").update({ status: "error", error: e.message }).eq("id", item.id);
+    }
+  }
+}
+
+// Time-gated trigger: check every 15 min; fire once per day at/after RETRY_HOUR.
+setInterval(() => {
+  const now = new Date();
+  const today = now.toISOString().slice(0, 10);
+  if (now.getHours() >= RETRY_HOUR && lastRetryDate !== today) {
+    lastRetryDate = today;
+    console.log(`⏰ ${now.toLocaleTimeString()} — running afternoon retry pass`);
+    retryFailedForToday().catch(e => console.log("afternoon retry:", e.message));
+  }
+}, 15 * 60 * 1000);
+
+// Manual trigger for testing.
+app.post("/api/retry-failed/run-now", async (req, res) => {
+  res.json({ ok: true, message: "Afternoon retry started — watch server logs." });
+  retryFailedForToday().catch(e => console.log("retry-now:", e.message));
+});
 
 // ====================================================================
 //  YOUTUBE settings (per client) — official API only
