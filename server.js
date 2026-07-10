@@ -32,6 +32,17 @@ app.use("/assets", express.static(path.join(__dirname, "assets")));
 const upload = multer({ dest: "uploads/" });
 ["uploads", "outputs", "assets"].forEach(d => fs.mkdirSync(path.join(__dirname, d), { recursive: true }));
 
+// LOCAL calendar day (YYYY-MM-DD). "today" must mean the operator's day, not UTC
+// (UTC can be a day behind near midnight IST). Defaults to IST (+330 min);
+// override with TZ_OFFSET_MINUTES in the environment (e.g. -480 for US Pacific).
+const TZ_OFFSET_MIN = parseInt(process.env.TZ_OFFSET_MINUTES || "330", 10);
+function localToday() {
+  return new Date(Date.now() + TZ_OFFSET_MIN * 60000).toISOString().slice(0, 10);
+}
+function localHour() {
+  return new Date(Date.now() + TZ_OFFSET_MIN * 60000).getUTCHours();
+}
+
 // ── live job log streaming ─────────────────────────────────────────
 const jobs = new Map(); // jobId -> { logs:[], ws, videoId }
 let generationBusy = false; // true while a Flow browser session is running (serializes generations)
@@ -353,7 +364,7 @@ app.post("/api/clients/:id/generate", upload.fields([{ name: "image", maxCount: 
     // IPs get flagged by Flow. Instead, queue the job: create a calendar item
     // the local poller will pick up and generate on the real-IP machine.
     if (process.env.DASHBOARD_ONLY === "1") {
-      const today = new Date().toISOString().slice(0, 10);
+      const today = localToday();
       let queuedItemId = calItemId;
       if (!queuedItemId) {
         const { data: ci } = await supabase.from("calendar_items").insert({
@@ -876,7 +887,7 @@ app.post("/api/clients/:id/rss/run-now", async (req, res) => {
   if (!clientFeeds(client)) return res.status(400).json({ error: "no RSS categories or feeds configured" });
   res.json({ ok: true, message: "RSS run started — watch the server logs and the client's calendar." });
   (async () => {
-    const today = new Date().toISOString().slice(0, 10);
+    const today = localToday();
     try {
       const fresh = await pickDailyNews(client);
       console.log(`📰 [run-now] RSS [${client.name}] ${fresh.length} unique article(s)`);
@@ -888,7 +899,7 @@ app.post("/api/clients/:id/rss/run-now", async (req, res) => {
 
 // Daily scheduler: for each RSS client, pick unique per-category news & auto-generate
 async function runRssScheduler() {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = localToday();
   let clients;
   try {
     const { data } = await supabase.from("clients").select("*").eq("mode", "rss");
@@ -1033,7 +1044,7 @@ let lastRetryDate = null;
 
 async function retryFailedForToday() {
   if (generationBusy) { console.log("↩︎ retry: generation busy, will try later"); return; }
-  const today = new Date().toISOString().slice(0, 10);
+  const today = localToday();
 
   // Items that were supposed to run today but didn't succeed.
   const { data: items } = await supabase.from("calendar_items")
@@ -1071,8 +1082,8 @@ async function retryFailedForToday() {
 // Time-gated trigger: check every 15 min; fire once per day at/after RETRY_HOUR.
 setInterval(() => {
   const now = new Date();
-  const today = now.toISOString().slice(0, 10);
-  if (now.getHours() >= RETRY_HOUR && lastRetryDate !== today) {
+  const today = localToday();
+  if (localHour() >= RETRY_HOUR && lastRetryDate !== today) {
     lastRetryDate = today;
     console.log(`⏰ ${now.toLocaleTimeString()} — running afternoon retry pass`);
     retryFailedForToday().catch(e => console.log("afternoon retry:", e.message));
