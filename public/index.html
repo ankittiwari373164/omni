@@ -511,10 +511,30 @@ async function renderCalendar(){
           <button class="btn btn-primary btn-sm" id="genCal" onclick="genCalendar()">Generate calendar</button>
         </div>
       `}
+      <div class="section-label" style="margin-top:14px">Upload calendar from Excel (.xlsx)</div>
+      <div class="btn-row" style="align-items:center;gap:8px">
+        <input type="file" id="xlsxFile" accept=".xlsx,.xls" style="max-width:260px">
+        <button class="btn btn-primary btn-sm" id="importXlsxBtn" onclick="importXlsx()">Upload &amp; replace calendar</button>
+      </div>
+      <div class="hint" style="margin-top:6px">Columns: <b>prompt</b> (required), <b>date</b> (YYYY-MM-DD, optional), <b>topic</b>, <b>hook</b>. Your prompts are kept — ChatGPT only enhances &amp; splits them, and generates per-part images. This replaces the current planned calendar.</div>
     </div>
     <div id="calList"><div class="hint">Loading…</div></div>`;
   const items = await api("/api/clients/"+currentClient.id+"/calendar");
   renderCalList(items);
+}
+async function importXlsx(){
+  const input = $("xlsxFile");
+  const file = input && input.files && input.files[0];
+  if(!file){ toast("Choose an .xlsx file first"); return; }
+  const btn = $("importXlsxBtn"); btn.disabled = true; const old = btn.textContent; btn.textContent = "Uploading…";
+  try{
+    const fd = new FormData();
+    fd.append("file", file);
+    const r = await api("/api/clients/"+currentClient.id+"/calendar/import-xlsx", { method:"POST", body: fd });
+    toast(r.message || ("Imported "+(r.imported||0)+" item(s) ✓"));
+    renderCalendar();
+  }catch(e){ toast("Error: "+e.message); }
+  if($("importXlsxBtn")){ btn.disabled=false; btn.textContent = old; }
 }
 async function fetchRss(){
   const btn=$("fetchRss"); btn.disabled=true; btn.textContent="Fetching…";
