@@ -298,9 +298,9 @@ function renderConfig(){
         <div class="hint">A reusable example. New prompts will match its shape, adapted to each topic.</div></div>
       <div class="field"><label>Video length</label>
         <select id="cfgVideoSeconds">
-          <option value="10" ${(c.video_seconds||(c.split_parts?20:10))==10?'selected':''}>10 seconds — single clip (1 part)</option>
-          <option value="20" ${(c.video_seconds||(c.split_parts?20:10))==20?'selected':''}>20 seconds — 2 parts, joined</option>
-          <option value="30" ${(c.video_seconds||(c.split_parts?20:10))==30?'selected':''}>30 seconds — 3 parts, joined</option>
+          <option value="10" ${(c.video_seconds||(c.split_parts===false?10:20))==10?'selected':''}>10 seconds — single clip (1 part)</option>
+          <option value="20" ${(c.video_seconds||(c.split_parts===false?10:20))==20?'selected':''}>20 seconds — 2 parts, joined</option>
+          <option value="30" ${(c.video_seconds||(c.split_parts===false?10:20))==30?'selected':''}>30 seconds — 3 parts, joined</option>
         </select>
         <div class="hint">The script is written as PART 1…N (each 10s), every part is generated separately with its own ChatGPT image, then all parts are concatenated and frame + outro applied.</div></div>
     </div>
