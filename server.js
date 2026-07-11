@@ -940,7 +940,8 @@ setTimeout(() => runRssScheduler().catch(() => {}), 30 * 1000);
 function partsForClient(client) {
   const sec = Number(client && client.video_seconds);
   if (sec === 10 || sec === 20 || sec === 30) return sec / 10;
-  return client && client.split_parts ? 2 : 1;
+  if (client && client.split_parts === false) return 1;   // explicitly single
+  return 2;   // default = 20s (2 parts)
 }
 
 async function promptForItem(client, item) {
