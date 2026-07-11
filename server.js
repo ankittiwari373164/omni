@@ -167,6 +167,7 @@ app.post("/api/clients/:id/config", upload.fields([
   if (b.image_chat_link !== undefined) patch.image_chat_link = b.image_chat_link || null;
   if (b.prompt_sample !== undefined) patch.prompt_sample = b.prompt_sample || null;
   if (b.split_parts !== undefined) patch.split_parts = b.split_parts === "true" || b.split_parts === true;
+  if (b.video_seconds !== undefined) { const s10 = Math.max(10, Math.min(30, Math.round(Number(b.video_seconds)/10)*10)); patch.video_seconds = [10,20,30].includes(s10) ? s10 : 10; }
   if (b.per_part_images !== undefined) patch.per_part_images = b.per_part_images === "true" || b.per_part_images === true;
   if (b.upload_to_drive !== undefined) patch.upload_to_drive = b.upload_to_drive === "true";
   if (b.drive_folder_id !== undefined) patch.drive_folder_id = b.drive_folder_id || null;
@@ -496,7 +497,7 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
       async function makePartImages(p) {
         const parts = groqLib.splitPromptParts(p);
         sendLog(jobId, "info", `🧪 Per-part images: detected ${parts.length} part(s)`);
-        if (parts.length < 2) return [];   // only split (2+ part) videos need per-part images
+        if (parts.length < 1) return [];   // one generated image PER part (incl. single 10s)
         if (!process.env.CHATGPT_SERVER_URL) {
           sendLog(jobId, "warn", "CHATGPT_SERVER_URL not set — skipping per-part images, using client image");
           return [];
@@ -558,7 +559,7 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
             const fresh = await groqLib.generatePrompt({
               businessName: client.name, businessDetails: client.business_details, chatLink: client.chatgpt_link,
               topic: videoTitle, styleKey: client.prompt_style, styleInstruction: client.prompt_custom,
-              promptSample: client.prompt_sample, splitParts: client.split_parts
+              promptSample: client.prompt_sample, parts: partsForClient(client)
             });
             currentPrompt = groqLib.sanitizePrompt(fresh);
             sendLog(jobId, "info", `📋 New prompt: ${currentPrompt.slice(0, 90)}…`);
@@ -852,7 +853,7 @@ async function generateNewsItem(client, it, dateStr) {
 
     const prompt = await groqLib.generateNewsPrompt({
       businessName: client.name, businessDetails: client.business_details, chatLink: client.chatgpt_link,
-      title: it.title, summary: it.summary, splitParts: client.split_parts
+      title: it.title, summary: it.summary, parts: partsForClient(client)
     });
     await supabase.from("calendar_items").update({ prompt }).eq("id", ci.id);
 
@@ -934,25 +935,33 @@ setTimeout(() => runRssScheduler().catch(() => {}), 30 * 1000);
 //   • source "rss"                       → generateNewsPrompt (theme-safe, split)
 //   • otherwise                          → generatePrompt (house calendar format)
 // ====================================================================
+// Number of 10s parts for a client: video_seconds (10/20/30 -> 1/2/3),
+// falling back to the legacy split_parts boolean (true=2, false=1).
+function partsForClient(client) {
+  const sec = Number(client && client.video_seconds);
+  if (sec === 10 || sec === 20 || sec === 30) return sec / 10;
+  return client && client.split_parts ? 2 : 1;
+}
+
 async function promptForItem(client, item) {
   if (item.user_prompt && String(item.user_prompt).trim()) {
     return groqLib.enhancePrompt({
       userPrompt: item.user_prompt,
       businessName: client.name, businessDetails: client.business_details,
-      splitParts: client.split_parts, chatLink: client.chatgpt_link
+      parts: partsForClient(client), chatLink: client.chatgpt_link
     });
   }
   if (item.source === "rss") {
     return groqLib.generateNewsPrompt({
       businessName: client.name, businessDetails: client.business_details, chatLink: client.chatgpt_link,
-      title: item.topic, summary: item.hook, splitParts: client.split_parts
+      title: item.topic, summary: item.hook, parts: partsForClient(client)
     });
   }
   return groqLib.generatePrompt({
     businessName: client.name, businessDetails: client.business_details, chatLink: client.chatgpt_link,
     topic: item.topic, hook: item.hook,
     styleKey: client.prompt_style, styleInstruction: client.prompt_custom,
-    promptSample: client.prompt_sample, splitParts: client.split_parts
+    promptSample: client.prompt_sample, parts: partsForClient(client)
   });
 }
 
