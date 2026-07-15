@@ -46,6 +46,7 @@ function localHour() {
 // ── live job log streaming ─────────────────────────────────────────
 const jobs = new Map(); // jobId -> { logs:[], ws, videoId }
 let generationBusy = false; // true while a Flow browser session is running (serializes generations)
+const activeItems = new Set(); // calendar_item ids being generated RIGHT NOW by this process
 
 wss.on("connection", (ws, req) => {
   const jobId = new URL(req.url, "http://localhost").searchParams.get("jobId");
@@ -400,7 +401,7 @@ app.post("/api/clients/:id/generate", upload.fields([{ name: "image", maxCount: 
 
     res.json({ jobId, videoId: videoRow.id });
 
-    if (calItemId) await supabase.from("calendar_items").update({ status: "generating" }).eq("id", calItemId);
+    if (calItemId) await supabase.from("calendar_items").update({ status: "generating", updated_at: new Date().toISOString() }).eq("id", calItemId);
 
     runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, topic });
   } catch (e) {
@@ -720,6 +721,7 @@ function generateOne({ client, prompt, topic, calItemId, link }) {
   const jobId = uuidv4();
   jobs.set(jobId, { logs: [], ws: null, clientId: client.id });
 
+  if (calItemId) activeItems.add(calItemId);
   return (async () => {
     // sync this client's assets to local disk first (no-op if already present)
     await assetsSync.ensureLocalAssets(client, path.join(__dirname, "assets"));
@@ -735,9 +737,10 @@ function generateOne({ client, prompt, topic, calItemId, link }) {
       title: topic || client.name, status: "generating"
     }).select().single();
     return new Promise(resolve => {
-      runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, topic, onComplete: resolve });
+      runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, topic,
+        onComplete: (ok) => { if (calItemId) activeItems.delete(calItemId); resolve(ok); } });
     });
-  })();
+  })().catch(e => { if (calItemId) activeItems.delete(calItemId); throw e; });
 }
 
 function waitUntilFree(timeoutMs = 20 * 60 * 1000) {
@@ -1052,42 +1055,88 @@ app.post("/api/clients/:id/calendar/import-xlsx", upload.single("file"), async (
 const RETRY_HOUR = parseInt(process.env.RETRY_HOUR || "15", 10);   // 15 = 3 PM local
 let lastRetryDate = null;
 
-async function retryFailedForToday() {
-  if (generationBusy) { console.log("↩︎ retry: generation busy, will try later"); return; }
-  const today = localToday();
+// ── RECOVERY SWEEP ─────────────────────────────────────────────────────
+// Crawls ALL clients for TODAY's calendar items and resumes anything that
+// didn't finish. Survives power cuts: when the PC boots and this process
+// starts, `activeItems` is empty, so items left marked "generating" by the
+// killed process are detected as stale and restarted automatically.
+//   done / uploaded / composited → skip (already produced today)
+//   error                        → restart
+//   generating older than STUCK_MINUTES and not running here → restart
+//   planned / prompt_ready       → start (unless RECOVER_PLANNED=0)
+const STUCK_MINUTES    = parseInt(process.env.STUCK_MINUTES || "30", 10);
+const SWEEP_MINUTES    = parseInt(process.env.SWEEP_MINUTES || "10", 10);
+const RECOVER_PLANNED  = process.env.RECOVER_PLANNED !== "0";   // default: also start not-yet-started items
+let sweepRunning = false;
 
-  // Items that were supposed to run today but didn't succeed.
-  const { data: items } = await supabase.from("calendar_items")
-    .select("*").eq("scheduled_date", today).in("status", ["error", "generating"]);
-  if (!items || !items.length) { console.log("↩︎ retry: nothing to retry"); return; }
+function isStale(item) {
+  const ts = item.updated_at || item.created_at;
+  if (!ts) return true;                       // no timestamp → assume orphaned
+  return (Date.now() - new Date(ts).getTime()) > STUCK_MINUTES * 60 * 1000;
+}
 
-  console.log(`↩︎ Afternoon retry: ${items.length} item(s) to re-attempt`);
-  const clientCache = {};
-  for (const item of items) {
-    try {
-      let client = clientCache[item.client_id];
-      if (!client) {
-        const { data: c } = await supabase.from("clients").select("*").eq("id", item.client_id).single();
-        client = clientCache[item.client_id] = c;
+async function runRecoverySweep(reason = "scheduled") {
+  if (sweepRunning) return;                   // never overlap sweeps
+  sweepRunning = true;
+  try {
+    const today = localToday();
+    const wanted = ["error", "generating"];
+    if (RECOVER_PLANNED) wanted.push("planned", "prompt_ready");
+
+    const { data: items } = await supabase.from("calendar_items")
+      .select("*").eq("scheduled_date", today).in("status", wanted);
+    if (!items || !items.length) { console.log(`🧹 sweep (${reason}): nothing pending for ${today}`); return; }
+
+    // Decide what actually needs (re)starting.
+    const todo = items.filter(it => {
+      if (activeItems.has(it.id)) return false;              // running right now here
+      if (it.status === "generating") return isStale(it);    // only if stuck > STUCK_MINUTES
+      return true;                                            // error / planned / prompt_ready
+    });
+    if (!todo.length) { console.log(`🧹 sweep (${reason}): ${items.length} pending, none stale/ready yet`); return; }
+
+    console.log(`🧹 sweep (${reason}): resuming ${todo.length} item(s) for ${today}`);
+    const clientCache = {};
+    for (const item of todo) {
+      try {
+        let client = clientCache[item.client_id];
+        if (!client) {
+          const { data: c } = await supabase.from("clients").select("*").eq("id", item.client_id).single();
+          client = clientCache[item.client_id] = c;
+        }
+        if (!client || client.active === false) continue;
+        if (!clientHasSession(client)) { console.log(`  ⏭️ ${client.name}: no login profile`); continue; }
+
+        // Retire any orphaned video rows for this item (from the killed run).
+        await supabase.from("videos").update({ status: "error", error: "orphaned — restarted by recovery sweep" })
+          .eq("calendar_item_id", item.id).eq("status", "generating");
+
+        const prompt = (item.prompt && item.prompt.trim()) ? item.prompt : await promptForItem(client, item);
+        await supabase.from("calendar_items")
+          .update({ status: "generating", prompt, error: null, updated_at: new Date().toISOString() })
+          .eq("id", item.id);
+
+        console.log(`  ▶ ${client.name}: ${item.topic || item.id} (was ${item.status})`);
+        await waitUntilFree();                                 // one Flow session at a time
+        await generateOne({ client, prompt, topic: item.topic, calItemId: item.id, link: item.link });
+      } catch (e) {
+        console.log(`  ✗ sweep failed for item ${item.id}: ${e.message}`);
+        await supabase.from("calendar_items")
+          .update({ status: "error", error: e.message, updated_at: new Date().toISOString() }).eq("id", item.id);
       }
-      if (!client) continue;
-      if (!clientHasSession(client)) { console.log(`  ⏭️ ${client.name}: no login profile`); continue; }
-
-      // Mark any stuck video rows for this item as error so they don't linger.
-      await supabase.from("videos").update({ status: "error", error: "superseded by afternoon retry" })
-        .eq("calendar_item_id", item.id).in("status", ["generating"]);
-
-      const prompt = (item.prompt && item.prompt.trim()) ? item.prompt : await promptForItem(client, item);
-      await supabase.from("calendar_items").update({ status: "generating", prompt, error: null }).eq("id", item.id);
-
-      await waitUntilFree();
-      await generateOne({ client, prompt, topic: item.topic, calItemId: item.id, link: item.link });
-    } catch (e) {
-      console.log(`  ✗ retry failed for item ${item.id}: ${e.message}`);
-      await supabase.from("calendar_items").update({ status: "error", error: e.message }).eq("id", item.id);
     }
+  } finally {
+    sweepRunning = false;
   }
 }
+
+// Back-compat: the afternoon pass now uses the same engine.
+async function retryFailedForToday() { return runRecoverySweep("afternoon"); }
+
+// Continuous recovery: every SWEEP_MINUTES, plus ~60s after startup so a
+// power-cut/reboot resumes today's unfinished work with no manual action.
+setInterval(() => runRecoverySweep("scheduled").catch(e => console.log("sweep:", e.message)), SWEEP_MINUTES * 60 * 1000);
+setTimeout(() => runRecoverySweep("startup").catch(e => console.log("sweep:", e.message)), 60 * 1000);
 
 // Time-gated trigger: check every 15 min; fire once per day at/after RETRY_HOUR.
 setInterval(() => {
