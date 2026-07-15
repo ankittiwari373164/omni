@@ -8,6 +8,7 @@ const cors = require("cors");
 const { v4: uuidv4 } = require("uuid");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const { spawn } = require("child_process");
 
 const supabase = require("./lib/supabase");
@@ -490,46 +491,41 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
       let currentPrompt = prompt;
       let success = false;
 
-      // Per-part reference images: ask the ChatGPT image server to create ONE
-      // image per part (from that part's scene text), save it locally, and paste
-      // the matching image when generating each part. Falls back to the client's
-      // shared image if a part image can't be made.
-      let partImages = [];
-      async function makePartImages(p) {
-        const parts = groqLib.splitPromptParts(p);
-        sendLog(jobId, "info", `🧪 Per-part images: detected ${parts.length} part(s)`);
-        if (parts.length < 1) return [];   // one generated image PER part (incl. single 10s)
+      // ── RESUMABLE per-part cache ───────────────────────────────────────
+      // Part clips and their images are keyed by the CALENDAR ITEM (stable
+      // across runs) + a hash of that part's text. So if credits run out or the
+      // power dies after part 1, the next crawl REUSES part 1's saved clip and
+      // image and generates ONLY the missing part(s), then concatenates and
+      // composites as normal. Changing the prompt changes the hash, which
+      // correctly forces a fresh render.
+      const stableKey = (videoRow && videoRow.calendar_item_id) || jobId;
+      const partHash = (t) => crypto.createHash("sha1").update(String(t)).digest("hex").slice(0, 8);
+      const partVideoPath = (i, t) => path.join(outDir, `part_${stableKey}_${i}_${partHash(t)}.mp4`);
+      const partImgPath   = (i, t) => path.join(__dirname, "uploads", `partimg_${stableKey}_${i}_${partHash(t)}.png`);
+      const bigEnough = (p) => { try { return fs.statSync(p).size > 10000; } catch { return false; } };
+
+      // Make (or reuse) the ChatGPT image for ONE part — never re-buys an image
+      // that was already produced for this exact part text.
+      async function imageForPart(i, text) {
+        const fp = partImgPath(i, text);
+        if (bigEnough(fp)) { sendLog(jobId, "info", `♻️ Reusing saved image for part ${i + 1}`); return fp; }
         if (!process.env.CHATGPT_SERVER_URL) {
-          sendLog(jobId, "warn", "CHATGPT_SERVER_URL not set — skipping per-part images, using client image");
-          return [];
+          sendLog(jobId, "warn", "CHATGPT_SERVER_URL not set — using client image");
+          return null;
         }
-        const local = [];
-        for (let k = 0; k < parts.length; k++) {
-          try {
-            sendLog(jobId, "progress", `🖼️ Creating image for part ${k + 1}…`);
-            const dataUrl = await groqLib.generateImage(parts[k], client.image_chat_link || "");  // this client's image chat (blank = fresh chat)
-            let buf;
-            if (dataUrl.startsWith("data:")) {
-              buf = Buffer.from(dataUrl.split(",")[1], "base64");
-            } else {
-              const r = await fetch(dataUrl);
-              buf = Buffer.from(await r.arrayBuffer());
-            }
-            const fp = path.join(__dirname, "uploads", `partimg_${jobId}_${k}.png`);
-            fs.writeFileSync(fp, buf);
-            local[k] = fp;
-            sendLog(jobId, "success", `✅ Image ready for part ${k + 1}`);
-          } catch (e) {
-            sendLog(jobId, "warn", `Part ${k + 1} image failed (${e.message}) — using client image`);
-            local[k] = null;
-          }
+        try {
+          sendLog(jobId, "progress", `🖼️ Creating image for part ${i + 1}…`);
+          const dataUrl = await groqLib.generateImage(text, client.image_chat_link || "");
+          let buf;
+          if (dataUrl.startsWith("data:")) buf = Buffer.from(dataUrl.split(",")[1], "base64");
+          else { const r = await fetch(dataUrl); buf = Buffer.from(await r.arrayBuffer()); }
+          fs.writeFileSync(fp, buf);
+          sendLog(jobId, "success", `✅ Image ready for part ${i + 1}`);
+          return fp;
+        } catch (e) {
+          sendLog(jobId, "warn", `Part ${i + 1} image failed (${e.message}) — using client image`);
+          return null;
         }
-        return local;
-      }
-      try {
-        partImages = await makePartImages(currentPrompt);
-      } catch (e) {
-        sendLog(jobId, "warn", `Per-part image step error: ${e.message}`);
       }
 
       for (let attempt = 1; attempt <= MAX_ATTEMPTS && !success; attempt++) {
@@ -539,14 +535,24 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
         let failed = false, policy = false;
 
         for (let i = 0; i < parts.length; i++) {
+          const keep = partVideoPath(i, parts[i]);
+          // Produced by an earlier run (credits/power died) → reuse, don't re-render.
+          if (bigEnough(keep)) {
+            sendLog(jobId, "success", `♻️ Part ${i + 1}/${parts.length} already generated — reusing saved clip`);
+            rawFiles.push(path.basename(keep));
+            continue;
+          }
           if (parts.length > 1) sendLog(jobId, "progress", `🎬 Generating part ${i + 1}/${parts.length}…`);
-          // Paste BOTH the per-part generated image AND the client's reference
-          // image into Flow (per-part first as the frame, reference as anchor).
-          const imgs = [...new Set([partImages[i], imagePath].filter(Boolean))];
+          // Image is created only for parts that still need rendering.
+          const partImg = await imageForPart(i, parts[i]);
+          // Paste BOTH the per-part image AND the client's reference image.
+          const imgs = [...new Set([partImg, imagePath].filter(Boolean))];
           if (imgs.length) sendLog(jobId, "info", `🖼️ Part ${i + 1}: pasting ${imgs.length} image(s) into Flow`);
           const res = await generatePart({ jobId, partIndex: i, cookiesPath, profileDir, imagePaths: imgs, prompt: parts[i] });
           if (!res.file) { failed = true; policy = res.policy; break; }
-          rawFiles.push(res.file);
+          // Persist under the stable name so a later crawl can reuse it.
+          try { fs.renameSync(path.join(outDir, res.file), keep); rawFiles.push(path.basename(keep)); }
+          catch { rawFiles.push(res.file); }
         }
 
         if (!failed) { success = true; break; }
@@ -1065,7 +1071,7 @@ let lastRetryDate = null;
 //   generating older than STUCK_MINUTES and not running here → restart
 //   planned / prompt_ready       → start (unless RECOVER_PLANNED=0)
 const STUCK_MINUTES    = parseInt(process.env.STUCK_MINUTES || "30", 10);
-const SWEEP_MINUTES    = parseInt(process.env.SWEEP_MINUTES || "10", 10);
+const SWEEP_MINUTES    = parseInt(process.env.SWEEP_MINUTES || "240", 10);   // crawl every 4 hours
 const RECOVER_PLANNED  = process.env.RECOVER_PLANNED !== "0";   // default: also start not-yet-started items
 let sweepRunning = false;
 
@@ -1076,6 +1082,8 @@ function isStale(item) {
 }
 
 async function runRecoverySweep(reason = "scheduled") {
+  // Dashboard-only deployments (e.g. Render) can't drive Flow — never sweep there.
+  if (process.env.DASHBOARD_ONLY === "1") return;
   if (sweepRunning) return;                   // never overlap sweeps
   sweepRunning = true;
   try {
@@ -1133,8 +1141,8 @@ async function runRecoverySweep(reason = "scheduled") {
 // Back-compat: the afternoon pass now uses the same engine.
 async function retryFailedForToday() { return runRecoverySweep("afternoon"); }
 
-// Continuous recovery: every SWEEP_MINUTES, plus ~60s after startup so a
-// power-cut/reboot resumes today's unfinished work with no manual action.
+// Recovery crawl: every SWEEP_MINUTES (default 4 hours), plus ~60s after
+// startup so a power-cut/reboot resumes today's unfinished work immediately.
 setInterval(() => runRecoverySweep("scheduled").catch(e => console.log("sweep:", e.message)), SWEEP_MINUTES * 60 * 1000);
 setTimeout(() => runRecoverySweep("startup").catch(e => console.log("sweep:", e.message)), 60 * 1000);
 
