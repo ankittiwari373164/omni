@@ -19,6 +19,7 @@ const googleLib = require("./lib/google");
 const rssLib = require("./lib/rss");
 const feedsLib = require("./lib/feeds");
 const { buildScript } = require("./lib/flow");
+const schedulerCalendar = require("./lib/schedulerCalendar");
 
 const app = express();
 const server = http.createServer(app);
@@ -236,58 +237,50 @@ app.delete("/api/clients/:id", async (req, res) => {
 // ====================================================================
 //  CONTENT CALENDAR
 // ====================================================================
+// Calendar now lives in the scheduler app (Supabase `calendar_items`,
+// shared with the chatgpt-main program). This route just proxies.
 app.get("/api/clients/:id/calendar", async (req, res) => {
-  const { data, error } = await supabase.from("calendar_items")
-    .select("*").eq("client_id", req.params.id).order("scheduled_date");
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
+  try {
+    const data = await schedulerCalendar.list(req.params.id);
+    res.json(data);
+  } catch (e) {
+    res.status(502).json({ error: `scheduler calendar fetch failed: ${e.message}` });
+  }
 });
 
-// Generate calendar via Groq and store it
+// Generate calendar — delegates the Groq call + storage to the scheduler.
 app.post("/api/clients/:id/calendar/generate", async (req, res) => {
   try {
     const { days = 30, startDate } = req.body;
     const { data: client } = await supabase.from("clients").select("*").eq("id", req.params.id).single();
     if (!client) return res.status(404).json({ error: "client not found" });
 
-    const items = await groqLib.generateCalendar({
-      businessName: client.name,
-      businessDetails: client.business_details, chatLink: client.chatgpt_link,
-      days, startDate
+    const data = await schedulerCalendar.generate({
+      clientId: client.id,
+      clientName: client.name,
+      businessDetails: client.business_details,
+      days, startDate,
+      chatLink: client.chatgpt_link
     });
-
-    // REPLACE: remove existing not-yet-produced items for this client so the new
-    // calendar takes their place. Keep items already done/generating/uploaded so
-    // we never wipe finished work or an in-progress job.
-    await supabase.from("calendar_items")
-      .delete()
-      .eq("client_id", client.id)
-      .in("status", ["planned", "prompt_ready", "error"]);
-
-    const rows = items.map(it => ({ ...it, client_id: client.id, status: "planned" }));
-    const { data, error } = await supabase.from("calendar_items").insert(rows).select();
-    if (error) throw error;
     res.json(data);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(502).json({ error: `scheduler calendar generate failed: ${e.message}` });
   }
 });
 
-// Generate a Flow prompt for one calendar item
+// Generate a Flow prompt for one calendar item (item now lives in scheduler's Supabase table)
 app.post("/api/calendar/:itemId/prompt", async (req, res) => {
   try {
-    const { data: item } = await supabase.from("calendar_items").select("*").eq("id", req.params.itemId).single();
+    const item = await schedulerCalendar.get(req.params.itemId);
     if (!item) return res.status(404).json({ error: "item not found" });
     const { data: client } = await supabase.from("clients").select("*").eq("id", item.client_id).single();
 
     const prompt = await promptForItem(client, item);
 
-    const { data, error } = await supabase.from("calendar_items")
-      .update({ prompt, status: "prompt_ready" }).eq("id", item.id).select().single();
-    if (error) throw error;
+    const data = await schedulerCalendar.update(item.id, { prompt, status: "prompt_ready" });
     res.json(data);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(502).json({ error: `scheduler calendar update failed: ${e.message}` });
   }
 });
 
