@@ -328,7 +328,10 @@ function renderConfig(){
       <div class="section-label">Day-fixed monthly topics <span style="color:var(--muted);font-weight:400">(independent of RSS categories)</span></div>
       <div class="hint" style="margin-bottom:8px">Pick specific weekdays that always use ONE fixed topic for the whole month. On that day, the topic's latest news article is fetched, distilled into a safe theme, and turned into a video the same way as everything else — automatically, once a day.</div>
       <div id="topicDaysBox"></div>
-      <button type="button" class="btn btn-sm" onclick="addTopicDayRow()">+ Add a day/topic</button>
+      <div class="btn-row" style="margin-top:6px">
+        <button type="button" class="btn btn-sm" onclick="addTopicDayRow()">+ Add a day/topic</button>
+        <button type="button" class="btn btn-sm" onclick="generateTopicDayNow()" title="Actually generates a video using the first configured day/topic, right now">▶ Run today's generation now</button>
+      </div>
     </div>
 
     <div class="card">
@@ -541,24 +544,73 @@ async function saveConfig(){
   btn.disabled=false; btn.textContent="Save config";
 }
 const WEEKDAY_OPTS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
-function renderTopicDays(rows){
-  const box = $("topicDaysBox"); if(!box) return;
-  const list = Array.isArray(rows) && rows.length ? rows : [];
-  box.innerHTML = list.map((r,i)=>`
-    <div class="row topic-day-row" style="align-items:center;margin-bottom:6px">
-      <select class="tdDay" style="max-width:110px">${WEEKDAY_OPTS.map(d=>`<option value="${d}" ${r.day===d?'selected':''}>${d}</option>`).join("")}</select>
-      <input type="text" class="tdTopic" value="${esc(r.topic||"")}" placeholder="e.g. AI news, productivity tips" style="flex:1">
-      <button type="button" class="btn btn-sm" style="color:var(--red)" onclick="this.closest('.topic-day-row').remove()">✕</button>
-    </div>`).join("") || `<div class="hint">No fixed topic-days yet.</div>`;
+let TOPIC_DAY_CATEGORIES = [];
+async function ensureTopicDayCategories(){
+  if(TOPIC_DAY_CATEGORIES.length) return TOPIC_DAY_CATEGORIES;
+  try{ TOPIC_DAY_CATEGORIES = await api("/api/feed-categories"); }catch{ TOPIC_DAY_CATEGORIES = []; }
+  return TOPIC_DAY_CATEGORIES;
 }
-function addTopicDayRow(){
-  renderTopicDays([...collectTopicDays(), { day: "Mon", topic: "" }]);
+function topicDayRowHtml(r){
+  const isCategory = r.type === "category";
+  const catOpts = TOPIC_DAY_CATEGORIES.map(c=>`<option value="${esc(c.id)}" ${r.category===c.id?'selected':''}>${esc(c.label)}</option>`).join("");
+  return `
+    <div class="row topic-day-row" style="align-items:center;margin-bottom:6px;gap:6px">
+      <select class="tdDay" style="max-width:90px">${WEEKDAY_OPTS.map(d=>`<option value="${d}" ${r.day===d?'selected':''}>${d}</option>`).join("")}</select>
+      <select class="tdType" style="max-width:130px" onchange="this.closest('.topic-day-row').querySelector('.tdTopicWrap').classList.toggle('hidden', this.value==='category'); this.closest('.topic-day-row').querySelector('.tdCatWrap').classList.toggle('hidden', this.value!=='category');">
+        <option value="topic" ${!isCategory?'selected':''}>Fixed topic (search)</option>
+        <option value="category" ${isCategory?'selected':''}>Category (whole week's articles)</option>
+      </select>
+      <div class="tdTopicWrap ${isCategory?'hidden':''}" style="flex:1">
+        <input type="text" class="tdTopic" value="${esc(r.topic||"")}" placeholder="e.g. productivity tips" style="width:100%">
+      </div>
+      <div class="tdCatWrap ${isCategory?'':'hidden'}" style="flex:1">
+        <select class="tdCategory" style="width:100%">${catOpts}</select>
+      </div>
+      <button type="button" class="btn btn-sm" onclick="testTopicDayRow(this)" title="Fetch a test article now, no video generated">🧪 Test</button>
+      <button type="button" class="btn btn-sm" style="color:var(--red)" onclick="this.closest('.topic-day-row').remove()">✕</button>
+    </div>`;
+}
+async function renderTopicDays(rows){
+  const box = $("topicDaysBox"); if(!box) return;
+  await ensureTopicDayCategories();
+  const list = Array.isArray(rows) && rows.length ? rows : [];
+  box.innerHTML = list.map(topicDayRowHtml).join("") || `<div class="hint">No fixed topic-days yet.</div>`;
+}
+async function addTopicDayRow(){
+  await ensureTopicDayCategories();
+  renderTopicDays([...collectTopicDays(), { day: "Mon", type: "topic", topic: "" }]);
 }
 function collectTopicDays(){
-  return [...document.querySelectorAll("#topicDaysBox .topic-day-row")].map(row=>({
-    day: row.querySelector(".tdDay").value,
-    topic: row.querySelector(".tdTopic").value.trim()
-  })).filter(r=>r.topic);
+  return [...document.querySelectorAll("#topicDaysBox .topic-day-row")].map(row=>{
+    const type = row.querySelector(".tdType").value;
+    return type === "category"
+      ? { day: row.querySelector(".tdDay").value, type: "category", category: row.querySelector(".tdCategory").value }
+      : { day: row.querySelector(".tdDay").value, type: "topic", topic: row.querySelector(".tdTopic").value.trim() };
+  }).filter(r => r.type === "category" ? !!r.category : !!r.topic);
+}
+async function testTopicDayRow(btn){
+  if(!currentClient) return;
+  const row = btn.closest(".topic-day-row");
+  const type = row.querySelector(".tdType").value;
+  const body = type === "category"
+    ? { category: row.querySelector(".tdCategory").value }
+    : { topic: row.querySelector(".tdTopic").value.trim() };
+  if(!body.category && !body.topic) return toast("Enter a topic or pick a category first");
+  const orig = btn.textContent; btn.textContent = "…"; btn.disabled = true;
+  try{
+    const r = await api("/api/clients/"+currentClient.id+"/topic-days/test-fetch", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body) });
+    if(!r.found) toast("No article found for that "+(type==="category"?"category":"topic")+" right now — try again later.");
+    else toast("✓ Found: \""+r.article.title+"\" — "+r.article.link);
+  }catch(e){ toast("Error: "+e.message); }
+  btn.textContent = orig; btn.disabled = false;
+}
+async function generateTopicDayNow(){
+  if(!currentClient) return;
+  if(!confirm("Run today's topic-day generation for this client right now? This will actually produce a video (uses your Flow session).")) return;
+  try{
+    const r = await api("/api/clients/"+currentClient.id+"/topic-days/run-now", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({}) });
+    toast(r.message || "Started ✓");
+  }catch(e){ toast("Error: "+e.message); }
 }
 
 async function populateProductWeek(){
