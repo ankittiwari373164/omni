@@ -1040,6 +1040,33 @@ setTimeout(() => runRssScheduler().catch(() => {}), 30 * 1000);
 // ====================================================================
 const WEEKDAY_NAMES = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
 
+// Resolve ONE topic-day entry to a fresh article, whichever type it is:
+//  - { type:"category", category:"technology" } → pick a fresh article from
+//    that curated category's feeds (same feeds as the RSS mode uses), skipping
+//    any link this client has already produced/queued.
+//  - { type:"topic", topic:"..." } (or legacy {topic} with no type) → Google
+//    News search for that exact free-text topic (fetchTopicArticle).
+// Returns { title, summary, link, isoDate, _label } or null.
+async function resolveDayEntryArticle(client, entry) {
+  if (entry.type === "category" && entry.category) {
+    const feeds = feedsLib.feedsForCategories([entry.category]);
+    if (!feeds.length) return null;
+    const { data: existing } = await supabase.from("calendar_items")
+      .select("link").eq("client_id", client.id).not("link", "is", null);
+    const used = new Set((existing || []).map(e => e.link));
+    let items = [];
+    try { items = await rssLib.fetchFeeds(feeds.join("\n"), 15); } catch {}
+    const pick = items.find(i => i.link && !used.has(i.link));
+    if (!pick) return null;
+    const label = feedsLib.CATEGORIES[entry.category]?.label || entry.category;
+    return { title: pick.title, summary: pick.summary, link: pick.link, isoDate: pick.isoDate, _label: label };
+  }
+  const topic = entry.topic || "";
+  if (!topic.trim()) return null;
+  const article = await rssLib.fetchTopicArticle(topic);
+  return article ? { ...article, _label: topic } : null;
+}
+
 async function runTopicDaysScheduler() {
   const today = localToday();
   const todayName = WEEKDAY_NAMES[new Date().getDay()];
@@ -1051,26 +1078,26 @@ async function runTopicDaysScheduler() {
 
   for (const client of clients) {
     if (client.last_topic_run === today) continue; // already ran today
-    const entry = client.topic_days.find(e => e && e.day === todayName && String(e.topic || "").trim());
+    const entry = client.topic_days.find(e => e && e.day === todayName && (String(e.topic || "").trim() || (e.type === "category" && e.category)));
     if (!entry) continue;
     if (!clientHasSession(client)) { console.log(`⏭️  Topic-day [${client.name}] skipped — no login profile`); continue; }
 
     try {
-      const article = await rssLib.fetchTopicArticle(entry.topic);
-      if (!article) { console.log(`📌 Topic-day [${client.name}] "${entry.topic}": no article found today`); continue; }
+      const article = await resolveDayEntryArticle(client, entry);
+      if (!article) { console.log(`📌 Topic-day [${client.name}]: no article found today`); continue; }
 
       // Dedup: skip if we already made a video from this exact link.
       const { data: existing } = await supabase.from("calendar_items")
         .select("id").eq("client_id", client.id).eq("link", article.link).limit(1);
-      if (existing && existing.length) { console.log(`📌 Topic-day [${client.name}] "${entry.topic}": already produced this article`); }
+      if (existing && existing.length) { console.log(`📌 Topic-day [${client.name}] "${article._label}": already produced this article`); }
       else {
-        console.log(`📌 Topic-day [${client.name}] "${entry.topic}": ${article.title}`);
-        // topic (not the raw headline) is what's shown as the theme — already
-        // evergreen/brand-chosen, so skip the news-headline distillation pass,
+        console.log(`📌 Topic-day [${client.name}] "${article._label}": ${article.title}`);
+        // The day's label (topic OR category) is already an evergreen,
+        // brand-chosen concept, so skip the news-headline distillation pass,
         // but still run through generatePrompt's full safety/policy rules.
         await generateNewsItem(
           client,
-          { title: entry.topic, summary: article.summary, link: article.link, _skipThemeDistillation: true },
+          { title: article._label, summary: article.summary, link: article.link, _skipThemeDistillation: true },
           today
         );
       }
@@ -1084,21 +1111,52 @@ async function runTopicDaysScheduler() {
 setInterval(() => runTopicDaysScheduler().catch(e => console.log("Topic-day scheduler:", e.message)), 60 * 60 * 1000);
 setTimeout(() => runTopicDaysScheduler().catch(() => {}), 45 * 1000);
 
+// Fast test — just fetch the article, don't generate a video. No login
+// session needed. Good for quickly checking a topic/category actually
+// returns something before wiring up a full day.
+app.post("/api/clients/:id/topic-days/test-fetch", async (req, res) => {
+  try {
+    const { data: client } = await supabase.from("clients").select("*").eq("id", req.params.id).single();
+    if (!client) return res.status(404).json({ error: "client not found" });
+    let entry = null;
+    if (req.body && req.body.category) entry = { type: "category", category: req.body.category };
+    else if (req.body && req.body.topic) entry = { type: "topic", topic: req.body.topic };
+    else entry = (client.topic_days || [])[0] || null;
+    if (!entry || (!entry.topic && !entry.category)) return res.status(400).json({ error: "no topic or category configured/provided" });
+
+    const article = await resolveDayEntryArticle(client, entry);
+    if (!article) return res.json({ found: false });
+    res.json({ found: true, article });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Manual trigger for testing one client's topic-day right now (ignores the
-// once-a-day guard and the weekday check).
+// once-a-day guard and the weekday check). Accepts either:
+//   { topic: "AI news" }                          — free-text topic
+//   { category: "technology" }                     — curated category
+//   {} (no body)                                    — uses the client's first
+//                                                      configured topic_days entry
 app.post("/api/clients/:id/topic-days/run-now", async (req, res) => {
   const { data: client } = await supabase.from("clients").select("*").eq("id", req.params.id).single();
   if (!client) return res.status(404).json({ error: "client not found" });
-  const topic = (req.body && req.body.topic) || (client.topic_days || [])[0]?.topic;
-  if (!topic) return res.status(400).json({ error: "no topic configured for this client" });
+
+  let entry = null;
+  if (req.body && req.body.category) entry = { type: "category", category: req.body.category };
+  else if (req.body && req.body.topic) entry = { type: "topic", topic: req.body.topic };
+  else entry = (client.topic_days || [])[0] || null;
+  if (!entry || (!entry.topic && !entry.category)) return res.status(400).json({ error: "no topic or category configured/provided" });
   if (!clientHasSession(client)) return res.status(400).json({ error: "no login profile — run: node login-once.js " + client.id });
-  res.json({ ok: true, message: `Topic-day run started for "${topic}" — watch server logs.` });
+
+  const label = entry.type === "category" ? (feedsLib.CATEGORIES[entry.category]?.label || entry.category) : entry.topic;
+  res.json({ ok: true, message: `Topic-day test run started for "${label}" — watch server logs / the client's calendar.` });
   (async () => {
     const today = localToday();
     try {
-      const article = await rssLib.fetchTopicArticle(topic);
-      if (!article) return console.log(`[run-now topic-day] no article found for "${topic}"`);
-      await generateNewsItem(client, { title: topic, summary: article.summary, link: article.link, _skipThemeDistillation: true }, today);
+      const article = await resolveDayEntryArticle(client, entry);
+      if (!article) return console.log(`[run-now topic-day] no article found for "${label}"`);
+      await generateNewsItem(client, { title: article._label, summary: article.summary, link: article.link, _skipThemeDistillation: true }, today);
     } catch (e) { console.log(`[run-now topic-day] error (${client.name}):`, e.message); }
   })();
 });
