@@ -944,9 +944,14 @@ async function pickDailyNews(client) {
 async function generateNewsItem(client, it, dateStr) {
   let ci = null;
   try {
+    // Same lifecycle as every other calendar item: starts "planned" (queued,
+    // nothing running yet) — NOT "generating", since we haven't even written
+    // the prompt yet. "generating" is reserved for the moment the Flow
+    // pipeline actually starts, matching the manual "Generate" button's
+    // convention (see calendar_items status update right before runPipeline).
     const ins = await supabase.from("calendar_items").insert({
       client_id: client.id, topic: it.title, hook: it.summary, link: it.link,
-      source: "rss", scheduled_date: dateStr, status: "generating"
+      source: "rss", scheduled_date: dateStr, status: "planned"
     }).select().single();
     ci = ins.data;
 
@@ -957,14 +962,19 @@ async function generateNewsItem(client, it, dateStr) {
       voiceoverLanguage: client.voiceover_language || "Hindi/Hinglish",
       skipThemeDistillation: it._skipThemeDistillation === true
     });
-    await supabase.from("calendar_items").update({ prompt }).eq("id", ci.id);
+    await supabase.from("calendar_items").update({ prompt, status: "prompt_ready" }).eq("id", ci.id);
 
     if (process.env.DASHBOARD_ONLY === "1") {
-      await supabase.from("calendar_items").update({ status: "prompt_ready" }).eq("id", ci.id);
+      // Dashboard-only instance stops here — item sits as "prompt_ready",
+      // same queued state a manually-typed calendar item would be in,
+      // waiting for the LOCAL worker's sweep to pick it up and generate.
       return;
     }
 
     await waitUntilFree();
+    // Flip to "generating" right as the actual Flow pipeline takes over —
+    // same moment/convention the manual "Generate" button uses.
+    await supabase.from("calendar_items").update({ status: "generating", updated_at: new Date().toISOString() }).eq("id", ci.id);
     // generateOne → runPipeline handles concat/composite AND the YouTube upload
     // with ChatGPT-generated title/description/tags/hashtags.
     await generateOne({ client, prompt, topic: it.title, calItemId: ci.id, link: it.link });
