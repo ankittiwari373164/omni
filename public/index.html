@@ -272,8 +272,9 @@ function renderConfig(){
       <div class="section-label">Content mode</div>
       <div class="field"><label>How this client gets video ideas</label>
         <select id="cfgMode" onchange="toggleRss()">
-          <option value="calendar" ${c.mode!=='rss'?'selected':''}>Content calendar (Groq-generated)</option>
+          <option value="calendar" ${c.mode!=='rss'&&c.mode!=='products'?'selected':''}>Content calendar (Groq-generated)</option>
           <option value="rss" ${c.mode==='rss'?'selected':''}>RSS news feeds (auto, daily)</option>
+          <option value="products" ${c.mode==='products'?'selected':''}>Products only (no calendar — 7 fixed days, fixed prompt)</option>
         </select></div>
       <div id="rssCfg" class="${c.mode==='rss'?'':'hidden'}">
         <div class="field"><label>News categories</label>
@@ -284,6 +285,50 @@ function renderConfig(){
         <div class="field" style="max-width:220px"><label>Max auto videos per day</label>
           <input type="number" id="cfgRssLimit" min="1" max="10" value="${c.rss_daily_limit||3}"></div>
       </div>
+      <div id="productsCfg" class="${c.mode==='products'?'':'hidden'}">
+        <div class="hint" style="margin-bottom:10px">No calendar for this client — just fill Fixed Prompt below, optionally upload product images, then click "Populate this week" (repeat weekly).</div>
+        <div class="field"><label>Product images (used one-per-day, cycling if fewer than 7)</label>
+          <div class="upload-zone"><input type="file" id="productImagesFile" accept="image/*" multiple><div>🛍️ Upload product photos</div>
+            <div class="upload-name" id="productImagesName">${(c.product_images||[]).length} image(s) set</div></div></div>
+        <button type="button" class="btn btn-sm" onclick="populateProductWeek()">📅 Populate this week (7 days)</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-label">Fixed prompt <span style="color:var(--muted);font-weight:400">(skip ChatGPT for the video prompt)</span></div>
+      <label class="toggle"><input type="checkbox" id="cfgFixedPromptMode" ${c.fixed_prompt_mode?'checked':''}> Always use this exact prompt — never call ChatGPT for it</label>
+      <div class="field"><label>Fixed video prompt</label>
+        <textarea id="cfgFixedPrompt" placeholder="Paste the exact, full Flow/Omni prompt to use for every video for this client.">${esc(c.fixed_prompt||"")}</textarea>
+        <div class="hint">Used verbatim, no ChatGPT call, when the toggle above is on. Also used automatically in "Products only" mode.</div></div>
+      <div class="field"><label>Fixed image-generation prompt (optional)</label>
+        <textarea id="cfgFixedImagePrompt" placeholder="If set, this exact text is used to generate the reference image for every part, instead of text derived from each scene.">${esc(c.fixed_image_prompt||"")}</textarea></div>
+    </div>
+
+    <div class="card">
+      <div class="section-label">Voiceover</div>
+      <label class="toggle"><input type="checkbox" id="cfgVoiceoverEnabled" ${c.voiceover_enabled!==false?'checked':''} onchange="$('voiceoverLangRow').classList.toggle('hidden', !this.checked)"> Include spoken voiceover in generated prompts</label>
+      <div class="field ${c.voiceover_enabled===false?'hidden':''}" id="voiceoverLangRow" style="max-width:280px">
+        <label>Voiceover language</label>
+        <select id="cfgVoiceoverLanguage">
+          <option value="Hindi/Hinglish" ${(c.voiceover_language||'Hindi/Hinglish')==='Hindi/Hinglish'?'selected':''}>Hindi/Hinglish</option>
+          <option value="English" ${c.voiceover_language==='English'?'selected':''}>English</option>
+          <option value="Hindi" ${c.voiceover_language==='Hindi'?'selected':''}>Hindi (Devanagari)</option>
+          <option value="Tamil" ${c.voiceover_language==='Tamil'?'selected':''}>Tamil</option>
+          <option value="Telugu" ${c.voiceover_language==='Telugu'?'selected':''}>Telugu</option>
+          <option value="Kannada" ${c.voiceover_language==='Kannada'?'selected':''}>Kannada</option>
+          <option value="Marathi" ${c.voiceover_language==='Marathi'?'selected':''}>Marathi</option>
+          <option value="Bengali" ${c.voiceover_language==='Bengali'?'selected':''}>Bengali</option>
+          <option value="Gujarati" ${c.voiceover_language==='Gujarati'?'selected':''}>Gujarati</option>
+        </select>
+        <div class="hint">ChatGPT writes the voiceover line in this language when generating prompts.</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-label">Day-fixed monthly topics <span style="color:var(--muted);font-weight:400">(independent of RSS categories)</span></div>
+      <div class="hint" style="margin-bottom:8px">Pick specific weekdays that always use ONE fixed topic for the whole month. On that day, the topic's latest news article is fetched, distilled into a safe theme, and turned into a video the same way as everything else — automatically, once a day.</div>
+      <div id="topicDaysBox"></div>
+      <button type="button" class="btn btn-sm" onclick="addTopicDayRow()">+ Add a day/topic</button>
     </div>
 
     <div class="card">
@@ -353,6 +398,8 @@ function renderConfig(){
   bindName("outroFile","outroName"); bindName("refFile","refName");
   loadStyles(c.prompt_style||"default");
   loadCategories((c.rss_categories||"").split(",").map(s=>s.trim()).filter(Boolean));
+  renderTopicDays(c.topic_days||[]);
+  bindProductImagesUpload();
 }
 let STYLES=[];
 async function loadStyles(selected){
@@ -377,7 +424,10 @@ async function loadCategories(selected){
   }catch{ box.textContent="Could not load categories."; }
 }
 function bindName(inputId,nameId){ const i=$(inputId); if(i) i.addEventListener("change",()=>{ if(i.files[0]) $(nameId).textContent=i.files[0].name; }); }
-function toggleRss(){ $("rssCfg").classList.toggle("hidden", $("cfgMode").value!=="rss"); }
+function toggleRss(){
+  $("rssCfg").classList.toggle("hidden", $("cfgMode").value!=="rss");
+  if ($("productsCfg")) $("productsCfg").classList.toggle("hidden", $("cfgMode").value!=="products");
+}
 
 function connectGoogle(){ window.open("/api/oauth/google/start?client_id="+currentClient.id, "_blank", "width=520,height=640");
   toast("Complete Google sign-in in the popup, then reopen this client."); }
@@ -469,6 +519,14 @@ async function saveConfig(){
     if($("cfgPromptCustom")) fd.append("prompt_custom", $("cfgPromptCustom").value);
     if($("cfgPromptSample")) fd.append("prompt_sample", $("cfgPromptSample").value);
     if($("cfgVideoSeconds")) { fd.append("video_seconds", $("cfgVideoSeconds").value); fd.append("split_parts", $("cfgVideoSeconds").value!=="10"); }
+    // fixed prompt / voiceover
+    if($("cfgFixedPromptMode")) fd.append("fixed_prompt_mode", $("cfgFixedPromptMode").checked);
+    if($("cfgFixedPrompt")) fd.append("fixed_prompt", $("cfgFixedPrompt").value);
+    if($("cfgFixedImagePrompt")) fd.append("fixed_image_prompt", $("cfgFixedImagePrompt").value);
+    if($("cfgVoiceoverEnabled")) fd.append("voiceover_enabled", $("cfgVoiceoverEnabled").checked);
+    if($("cfgVoiceoverLanguage")) fd.append("voiceover_language", $("cfgVoiceoverLanguage").value);
+    // day-fixed monthly topics
+    if($("topicDaysBox")) fd.append("topic_days", JSON.stringify(collectTopicDays()));
     const cats=[...document.querySelectorAll(".catChk:checked")].map(c=>c.value).join(",");
     fd.append("rss_categories", cats);
     if($("frameFile").files[0]) fd.append("frame", $("frameFile").files[0]);
@@ -482,6 +540,48 @@ async function saveConfig(){
   }catch(e){ toast("Error: "+e.message); }
   btn.disabled=false; btn.textContent="Save config";
 }
+const WEEKDAY_OPTS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+function renderTopicDays(rows){
+  const box = $("topicDaysBox"); if(!box) return;
+  const list = Array.isArray(rows) && rows.length ? rows : [];
+  box.innerHTML = list.map((r,i)=>`
+    <div class="row topic-day-row" style="align-items:center;margin-bottom:6px">
+      <select class="tdDay" style="max-width:110px">${WEEKDAY_OPTS.map(d=>`<option value="${d}" ${r.day===d?'selected':''}>${d}</option>`).join("")}</select>
+      <input type="text" class="tdTopic" value="${esc(r.topic||"")}" placeholder="e.g. AI news, productivity tips" style="flex:1">
+      <button type="button" class="btn btn-sm" style="color:var(--red)" onclick="this.closest('.topic-day-row').remove()">✕</button>
+    </div>`).join("") || `<div class="hint">No fixed topic-days yet.</div>`;
+}
+function addTopicDayRow(){
+  renderTopicDays([...collectTopicDays(), { day: "Mon", topic: "" }]);
+}
+function collectTopicDays(){
+  return [...document.querySelectorAll("#topicDaysBox .topic-day-row")].map(row=>({
+    day: row.querySelector(".tdDay").value,
+    topic: row.querySelector(".tdTopic").value.trim()
+  })).filter(r=>r.topic);
+}
+
+async function populateProductWeek(){
+  if(!currentClient) return;
+  try{
+    const r = await api("/api/clients/"+currentClient.id+"/products/populate-week", { method:"POST", body: JSON.stringify({}), headers:{"Content-Type":"application/json"} });
+    toast(r.inserted ? `Populated ${r.inserted} day(s) ✓` : (r.message||"Nothing to add"));
+  }catch(e){ toast("Error: "+e.message); }
+}
+
+function bindProductImagesUpload(){
+  const input = $("productImagesFile"); if(!input) return;
+  input.addEventListener("change", async ()=>{
+    if(!input.files.length || !currentClient) return;
+    const fd = new FormData();
+    [...input.files].forEach(f=>fd.append("images", f));
+    try{
+      currentClient = await api("/api/clients/"+currentClient.id+"/product-images", { method:"POST", body: fd });
+      toast("Product images uploaded ✓"); renderConfig();
+    }catch(e){ toast("Error: "+e.message); }
+  });
+}
+
 async function deleteRefImage(id){
   if(!confirm("Delete this client's reference image?")) return;
   try{
