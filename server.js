@@ -1064,20 +1064,25 @@ const WEEKDAY_NAMES = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
 async function resolveDayEntryArticle(client, entry) {
   if (entry.type === "category" && entry.category) {
     const feeds = feedsLib.feedsForCategories([entry.category]);
+    console.log(`[topic-day] category "${entry.category}" → ${feeds.length} feed(s): ${feeds.join(", ") || "(none — unknown category key?)"}`);
     if (!feeds.length) return null;
     const { data: existing } = await supabase.from("calendar_items")
       .select("link").eq("client_id", client.id).not("link", "is", null);
     const used = new Set((existing || []).map(e => e.link));
     let items = [];
-    try { items = await rssLib.fetchFeeds(feeds.join("\n"), 15); } catch {}
+    try { items = await rssLib.fetchFeeds(feeds.join("\n"), 15); }
+    catch (e) { console.log(`[topic-day] fetchFeeds threw: ${e.message}`); }
+    console.log(`[topic-day] fetched ${items.length} item(s), ${used.size} already used by this client`);
     const pick = items.find(i => i.link && !used.has(i.link));
-    if (!pick) return null;
+    if (!pick) { console.log(`[topic-day] no unused article found (all ${items.length} already used, or feeds returned 0)`); return null; }
     const label = feedsLib.CATEGORIES[entry.category]?.label || entry.category;
     return { title: pick.title, summary: pick.summary, link: pick.link, isoDate: pick.isoDate, _label: label };
   }
   const topic = entry.topic || "";
   if (!topic.trim()) return null;
+  console.log(`[topic-day] free-text topic search: "${topic}"`);
   const article = await rssLib.fetchTopicArticle(topic);
+  if (!article) console.log(`[topic-day] Google News search returned nothing for "${topic}"`);
   return article ? { ...article, _label: topic } : null;
 }
 
@@ -1183,10 +1188,13 @@ app.post("/api/clients/:id/topic-days/run-now", async (req, res) => {
   });
   (async () => {
     const today = localToday();
+    console.log(`[run-now topic-day] starting for ${client.name} — ${label}`);
     try {
       const article = await resolveDayEntryArticle(client, entry);
       if (!article) return console.log(`[run-now topic-day] no article found for "${label}"`);
+      console.log(`[run-now topic-day] found article: ${article.title} (${article.link})`);
       await generateNewsItem(client, { title: article._label, summary: article.summary, link: article.link, _skipThemeDistillation: true }, today);
+      console.log(`[run-now topic-day] generateNewsItem finished for ${client.name}`);
     } catch (e) { console.log(`[run-now topic-day] error (${client.name}):`, e.message); }
   })();
 });
