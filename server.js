@@ -180,10 +180,28 @@ app.post("/api/clients/:id/config", upload.fields([
   if (b.prompt_style !== undefined) patch.prompt_style = b.prompt_style || "default";
   if (b.prompt_custom !== undefined) patch.prompt_custom = b.prompt_custom || null;
   // content mode + RSS
-  if (b.mode !== undefined) patch.mode = b.mode === "rss" ? "rss" : "calendar";
+  if (b.mode !== undefined) patch.mode = ["rss", "products"].includes(b.mode) ? b.mode : "calendar";
   if (b.rss_feeds !== undefined) patch.rss_feeds = b.rss_feeds;
   if (b.rss_categories !== undefined) patch.rss_categories = b.rss_categories;
   if (b.rss_daily_limit !== undefined) patch.rss_daily_limit = parseInt(b.rss_daily_limit) || 3;
+
+  // Fixed prompt (skip ChatGPT entirely for the video prompt)
+  if (b.fixed_prompt_mode !== undefined) patch.fixed_prompt_mode = b.fixed_prompt_mode === "true" || b.fixed_prompt_mode === true;
+  if (b.fixed_prompt !== undefined) patch.fixed_prompt = b.fixed_prompt || null;
+  // Fixed prompt for the per-part IMAGE generation step
+  if (b.fixed_image_prompt !== undefined) patch.fixed_image_prompt = b.fixed_image_prompt || null;
+  // Voiceover on/off + language
+  if (b.voiceover_enabled !== undefined) patch.voiceover_enabled = b.voiceover_enabled === "true" || b.voiceover_enabled === true;
+  if (b.voiceover_language !== undefined) patch.voiceover_language = b.voiceover_language || "Hindi/Hinglish";
+  // Day-fixed monthly topics: [{day:"Mon",topic:"..."}]
+  if (b.topic_days !== undefined) {
+    try { patch.topic_days = typeof b.topic_days === "string" ? JSON.parse(b.topic_days) : b.topic_days; }
+    catch { return res.status(400).json({ error: "topic_days must be valid JSON" }); }
+  }
+  if (b.product_images !== undefined) {
+    try { patch.product_images = typeof b.product_images === "string" ? JSON.parse(b.product_images) : b.product_images; }
+    catch { return res.status(400).json({ error: "product_images must be valid JSON" }); }
+  }
 
   if (b.cookies) {
     try { patch.cookies = JSON.parse(b.cookies); }
@@ -245,6 +263,73 @@ app.get("/api/clients/:id/calendar", async (req, res) => {
     res.json(data);
   } catch (e) {
     res.status(502).json({ error: `scheduler calendar fetch failed: ${e.message}` });
+  }
+});
+
+// Product-mode: upload up to 7 product photos (appended to existing set).
+app.post("/api/clients/:id/product-images", upload.array("images", 7), async (req, res) => {
+  try {
+    const { data: client } = await supabase.from("clients").select("id,product_images").eq("id", req.params.id).single();
+    if (!client) return res.status(404).json({ error: "client not found" });
+    const existing = Array.isArray(client.product_images) ? client.product_images : [];
+    const added = [];
+    for (const f of (req.files || [])) {
+      const name = saveAsset(f, `product_${req.params.id}`);
+      await assetsSync.uploadAsset(path.join(__dirname, "assets", name), name);
+      added.push(name);
+    }
+    const product_images = [...existing, ...added].slice(0, 7);
+    const { data, error } = await supabase.from("clients").update({ product_images }).eq("id", req.params.id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ====================================================================
+//  PRODUCT MODE — no content calendar at all: 7 fixed daily slots (one
+//  week), each using client.fixed_prompt (skip ChatGPT) and one of the
+//  client's uploaded product images. Call this once to seed the week;
+//  call again next week to seed the next one (it only adds days that
+//  don't already have an item).
+// ====================================================================
+app.post("/api/clients/:id/products/populate-week", async (req, res) => {
+  try {
+    const { data: client } = await supabase.from("clients").select("*").eq("id", req.params.id).single();
+    if (!client) return res.status(404).json({ error: "client not found" });
+    if (!client.fixed_prompt || !String(client.fixed_prompt).trim()) {
+      return res.status(400).json({ error: "Set a Fixed Prompt for this client first (Config → Fixed Prompt)." });
+    }
+    const images = Array.isArray(client.product_images) ? client.product_images : [];
+
+    const startDate = req.body?.startDate ? new Date(req.body.startDate) : new Date();
+    const rows = [];
+    for (let i = 0; i < 7; i++) {
+      const d = new Date(startDate);
+      d.setDate(startDate.getDate() + i);
+      const dateStr = d.toISOString().slice(0, 10);
+      const img = images.length ? images[i % images.length] : null;
+      const label = img ? path.parse(img).name.replace(/[-_]+/g, " ") : `Product Day ${i + 1}`;
+      rows.push({
+        client_id: client.id, scheduled_date: dateStr, topic: label,
+        reference_image: img, status: "planned"
+      });
+    }
+
+    // Don't duplicate a date that already has an item for this client.
+    const { data: existing } = await supabase.from("calendar_items")
+      .select("scheduled_date").eq("client_id", client.id)
+      .in("scheduled_date", rows.map(r => r.scheduled_date));
+    const already = new Set((existing || []).map(e => e.scheduled_date));
+    const fresh = rows.filter(r => !already.has(r.scheduled_date));
+
+    if (!fresh.length) return res.json({ inserted: 0, message: "This week is already populated." });
+    const { data, error } = await supabase.from("calendar_items").insert(fresh).select();
+    if (error) throw error;
+    res.json({ inserted: data.length, items: data });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -411,7 +496,10 @@ app.post("/api/clients/:id/generate", upload.fields([{ name: "image", maxCount: 
 // Derive a short human title from a prompt when no topic is set (manual prompts).
 function deriveTitle(prompt) {
   const firstLine = String(prompt).split(/\n/).map(s => s.trim()).find(Boolean) || "video";
-  const clean = firstLine.replace(/^\*+|\*+$/g, "").replace(/[#*_`]/g, "").trim();
+  // Strip a leading "PART 1 (0-10 sec) — " style marker so the fallback
+  // title is just the actual short punchy title, never "PART 1 ...".
+  const noPartPrefix = firstLine.replace(/^PART\s*\d+\s*\([^)]*\)\s*[-–—]\s*/i, "").trim();
+  const clean = (noPartPrefix || firstLine).replace(/^\*+|\*+$/g, "").replace(/[#*_`]/g, "").trim();
   const words = clean.split(/\s+/).slice(0, 10).join(" ");
   return (words || "video").slice(0, 80);
 }
@@ -508,7 +596,13 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
         }
         try {
           sendLog(jobId, "progress", `🖼️ Creating image for part ${i + 1}…`);
-          const dataUrl = await groqLib.generateImage(text, client.image_chat_link || "");
+          // For clients with a fixed image-generation prompt configured, always
+          // use that exact text instead of the text derived from this part's
+          // scene — keeps product/reference imagery consistent across videos.
+          const imgPromptText = (client.fixed_image_prompt && client.fixed_image_prompt.trim())
+            ? client.fixed_image_prompt.trim()
+            : text;
+          const dataUrl = await groqLib.generateImage(imgPromptText, client.image_chat_link || "");
           let buf;
           if (dataUrl.startsWith("data:")) buf = Buffer.from(dataUrl.split(",")[1], "base64");
           else { const r = await fetch(dataUrl); buf = Buffer.from(await r.arrayBuffer()); }
@@ -656,11 +750,11 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
             businessName: client.name, businessDetails: client.business_details, chatLink: client.chatgpt_link,
             topic: videoTitle, prompt, defaultTags: client.yt_tags || client.yt_default_tags
           });
-          const title = videoTitle;   // use the prompt's title, not client name
           const hashtags = (client.yt_hashtags
             ? client.yt_hashtags.split(",").map(h => h.trim()).filter(Boolean).map(h => h.startsWith("#") ? h : "#" + h).join(" ")
             : (meta.hashtags || ""));
-          const descBase = applyTpl(client.yt_desc_tpl, { description: meta.description, client: client.name })
+          const title = applyTpl(client.yt_title_tpl, { title: videoTitle, topic: videoTitle, client: client.name, hashtags }) || videoTitle;
+          const descBase = applyTpl(client.yt_desc_tpl, { description: meta.description, client: client.name, hashtags })
             || meta.description || "";
           const description = `${descBase}\n\n${hashtags}`.trim();
           const tagSet = [
@@ -710,7 +804,7 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
 // ====================================================================
 
 // Reusable: run one full generation and resolve when the pipeline finishes.
-function generateOne({ client, prompt, topic, calItemId, link }) {
+function generateOne({ client, prompt, topic, calItemId, link, referenceImage }) {
   let cookiesPath = null;
   if (client.cookies) {
     cookiesPath = path.join(__dirname, "uploads", `cookies_${uuidv4()}.json`);
@@ -725,9 +819,12 @@ function generateOne({ client, prompt, topic, calItemId, link }) {
     // sync this client's assets to local disk first (no-op if already present)
     await assetsSync.ensureLocalAssets(client, path.join(__dirname, "assets"));
 
+    // Per-item reference image (product mode: one product photo per day)
+    // takes priority over the client's single default reference image.
     let imagePath = null;
-    if (client.reference_image_path) {
-      const ref = path.join(__dirname, "assets", client.reference_image_path);
+    const preferredRef = referenceImage || client.reference_image_path;
+    if (preferredRef) {
+      const ref = path.join(__dirname, "assets", preferredRef);
       if (fs.existsSync(ref)) imagePath = ref;
     }
 
@@ -855,7 +952,10 @@ async function generateNewsItem(client, it, dateStr) {
 
     const prompt = await groqLib.generateNewsPrompt({
       businessName: client.name, businessDetails: client.business_details, chatLink: client.chatgpt_link,
-      title: it.title, summary: it.summary, parts: partsForClient(client)
+      title: it.title, summary: it.summary, parts: partsForClient(client),
+      voiceoverEnabled: client.voiceover_enabled !== false,
+      voiceoverLanguage: client.voiceover_language || "Hindi/Hinglish",
+      skipThemeDistillation: it._skipThemeDistillation === true
     });
     await supabase.from("calendar_items").update({ prompt }).eq("id", ci.id);
 
@@ -932,6 +1032,78 @@ setInterval(() => runRssScheduler().catch(e => console.log("RSS scheduler:", e.m
 setTimeout(() => runRssScheduler().catch(() => {}), 30 * 1000);
 
 // ====================================================================
+//  TOPIC-DAYS — day-fixed monthly topics (independent of RSS categories
+//  and independent of `mode`). Config: client.topic_days = [{day:"Mon",
+//  topic:"AI news"}, ...]. On a matching weekday, fetch that topic's
+//  LATEST article, distill+generate via the same safe pipeline as RSS,
+//  once per client per day.
+// ====================================================================
+const WEEKDAY_NAMES = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+
+async function runTopicDaysScheduler() {
+  const today = localToday();
+  const todayName = WEEKDAY_NAMES[new Date().getDay()];
+  let clients;
+  try {
+    const { data } = await supabase.from("clients").select("*").not("topic_days", "is", null);
+    clients = (data || []).filter(c => Array.isArray(c.topic_days) && c.topic_days.length);
+  } catch { return; }
+
+  for (const client of clients) {
+    if (client.last_topic_run === today) continue; // already ran today
+    const entry = client.topic_days.find(e => e && e.day === todayName && String(e.topic || "").trim());
+    if (!entry) continue;
+    if (!clientHasSession(client)) { console.log(`⏭️  Topic-day [${client.name}] skipped — no login profile`); continue; }
+
+    try {
+      const article = await rssLib.fetchTopicArticle(entry.topic);
+      if (!article) { console.log(`📌 Topic-day [${client.name}] "${entry.topic}": no article found today`); continue; }
+
+      // Dedup: skip if we already made a video from this exact link.
+      const { data: existing } = await supabase.from("calendar_items")
+        .select("id").eq("client_id", client.id).eq("link", article.link).limit(1);
+      if (existing && existing.length) { console.log(`📌 Topic-day [${client.name}] "${entry.topic}": already produced this article`); }
+      else {
+        console.log(`📌 Topic-day [${client.name}] "${entry.topic}": ${article.title}`);
+        // topic (not the raw headline) is what's shown as the theme — already
+        // evergreen/brand-chosen, so skip the news-headline distillation pass,
+        // but still run through generatePrompt's full safety/policy rules.
+        await generateNewsItem(
+          client,
+          { title: entry.topic, summary: article.summary, link: article.link, _skipThemeDistillation: true },
+          today
+        );
+      }
+      await supabase.from("clients").update({ last_topic_run: today }).eq("id", client.id);
+    } catch (e) {
+      console.log(`Topic-day scheduler error for ${client.name}:`, e.message);
+    }
+  }
+}
+
+setInterval(() => runTopicDaysScheduler().catch(e => console.log("Topic-day scheduler:", e.message)), 60 * 60 * 1000);
+setTimeout(() => runTopicDaysScheduler().catch(() => {}), 45 * 1000);
+
+// Manual trigger for testing one client's topic-day right now (ignores the
+// once-a-day guard and the weekday check).
+app.post("/api/clients/:id/topic-days/run-now", async (req, res) => {
+  const { data: client } = await supabase.from("clients").select("*").eq("id", req.params.id).single();
+  if (!client) return res.status(404).json({ error: "client not found" });
+  const topic = (req.body && req.body.topic) || (client.topic_days || [])[0]?.topic;
+  if (!topic) return res.status(400).json({ error: "no topic configured for this client" });
+  if (!clientHasSession(client)) return res.status(400).json({ error: "no login profile — run: node login-once.js " + client.id });
+  res.json({ ok: true, message: `Topic-day run started for "${topic}" — watch server logs.` });
+  (async () => {
+    const today = localToday();
+    try {
+      const article = await rssLib.fetchTopicArticle(topic);
+      if (!article) return console.log(`[run-now topic-day] no article found for "${topic}"`);
+      await generateNewsItem(client, { title: topic, summary: article.summary, link: article.link, _skipThemeDistillation: true }, today);
+    } catch (e) { console.log(`[run-now topic-day] error (${client.name}):`, e.message); }
+  })();
+});
+
+// ====================================================================
 //  PROMPT RESOLUTION for a calendar item
 //   • user_prompt present (Excel upload) → enhancePrompt (keep wording, reformat+split)
 //   • source "rss"                       → generateNewsPrompt (theme-safe, split)
@@ -947,24 +1119,37 @@ function partsForClient(client) {
 }
 
 async function promptForItem(client, item) {
+  // 1) Client configured to ALWAYS use one fixed prompt — never calls ChatGPT
+  //    for the video prompt at all.
+  if (client.fixed_prompt_mode && client.fixed_prompt && String(client.fixed_prompt).trim()) {
+    return String(client.fixed_prompt).trim();
+  }
+
+  const voiceoverEnabled = client.voiceover_enabled !== false; // default true
+  const voiceoverLanguage = client.voiceover_language || "Hindi/Hinglish";
+
   if (item.user_prompt && String(item.user_prompt).trim()) {
     return groqLib.enhancePrompt({
       userPrompt: item.user_prompt,
       businessName: client.name, businessDetails: client.business_details,
-      parts: partsForClient(client), chatLink: client.chatgpt_link
+      parts: partsForClient(client), chatLink: client.chatgpt_link,
+      voiceoverEnabled, voiceoverLanguage
     });
   }
   if (item.source === "rss") {
     return groqLib.generateNewsPrompt({
       businessName: client.name, businessDetails: client.business_details, chatLink: client.chatgpt_link,
-      title: item.topic, summary: item.hook, parts: partsForClient(client)
+      title: item.topic, summary: item.hook, parts: partsForClient(client),
+      voiceoverEnabled, voiceoverLanguage,
+      skipThemeDistillation: item.skip_theme_distillation === true
     });
   }
   return groqLib.generatePrompt({
     businessName: client.name, businessDetails: client.business_details, chatLink: client.chatgpt_link,
     topic: item.topic, hook: item.hook,
     styleKey: client.prompt_style, styleInstruction: client.prompt_custom,
-    promptSample: client.prompt_sample, parts: partsForClient(client)
+    promptSample: client.prompt_sample, parts: partsForClient(client),
+    voiceoverEnabled, voiceoverLanguage
   });
 }
 
@@ -1119,7 +1304,7 @@ async function runRecoverySweep(reason = "scheduled") {
 
         console.log(`  ▶ ${client.name}: ${item.topic || item.id} (was ${item.status})`);
         await waitUntilFree();                                 // one Flow session at a time
-        await generateOne({ client, prompt, topic: item.topic, calItemId: item.id, link: item.link });
+        await generateOne({ client, prompt, topic: item.topic, calItemId: item.id, link: item.link, referenceImage: item.reference_image || null });
       } catch (e) {
         console.log(`  ✗ sweep failed for item ${item.id}: ${e.message}`);
         await supabase.from("calendar_items")
