@@ -986,9 +986,19 @@ async function generateNewsItem(client, it, dateStr) {
 app.post("/api/clients/:id/rss/run-now", async (req, res) => {
   const { data: client } = await supabase.from("clients").select("*").eq("id", req.params.id).single();
   if (!client) return res.status(404).json({ error: "client not found" });
-  if (!clientHasSession(client)) return res.status(400).json({ error: "no login profile — run: node login-once.js " + client.id });
+  // On a DASHBOARD_ONLY instance (e.g. Render) this only fetches articles and
+  // writes prompts ("prompt_ready"); actual Flow generation happens on your
+  // local worker instance, which has its own session — no session needed here.
+  if (process.env.DASHBOARD_ONLY !== "1" && !clientHasSession(client)) {
+    return res.status(400).json({ error: "no login profile — run: node login-once.js " + client.id });
+  }
   if (!clientFeeds(client)) return res.status(400).json({ error: "no RSS categories or feeds configured" });
-  res.json({ ok: true, message: "RSS run started — watch the server logs and the client's calendar." });
+  res.json({
+    ok: true,
+    message: process.env.DASHBOARD_ONLY === "1"
+      ? "Fetching articles and queuing prompts — your local worker will generate the videos next time it syncs."
+      : "RSS run started — watch the server logs and the client's calendar."
+  });
   (async () => {
     const today = localToday();
     try {
@@ -1012,8 +1022,12 @@ async function runRssScheduler() {
   for (const client of clients) {
     if (client.last_rss_run === today) continue;        // already ran today
     const feeds = clientFeeds(client);
-    if (!clientHasSession(client) || !feeds) {
-      if (!clientHasSession(client)) console.log(`⏭️  RSS [${client.name}] skipped — no login profile (run: node login-once.js ${client.id})`);
+    // On DASHBOARD_ONLY (Render): still fetch + queue prompts, just never
+    // launches a browser — generateNewsItem() already stops at "prompt_ready"
+    // there. Only bail on missing session for the LOCAL worker instance.
+    const needsSession = process.env.DASHBOARD_ONLY !== "1" && !clientHasSession(client);
+    if (needsSession || !feeds) {
+      if (needsSession) console.log(`⏭️  RSS [${client.name}] skipped — no login profile (run: node login-once.js ${client.id})`);
       continue;
     }
     try {
@@ -1080,7 +1094,13 @@ async function runTopicDaysScheduler() {
     if (client.last_topic_run === today) continue; // already ran today
     const entry = client.topic_days.find(e => e && e.day === todayName && (String(e.topic || "").trim() || (e.type === "category" && e.category)));
     if (!entry) continue;
-    if (!clientHasSession(client)) { console.log(`⏭️  Topic-day [${client.name}] skipped — no login profile`); continue; }
+    // On a DASHBOARD_ONLY instance (e.g. Render) this only needs to fetch the
+    // article + write the prompt (status -> "prompt_ready"); the actual Flow
+    // generation happens on your LOCAL worker instance, which has its own
+    // login session and picks up "prompt_ready" items via its own sweep.
+    if (process.env.DASHBOARD_ONLY !== "1" && !clientHasSession(client)) {
+      console.log(`⏭️  Topic-day [${client.name}] skipped — no login profile`); continue;
+    }
 
     try {
       const article = await resolveDayEntryArticle(client, entry);
@@ -1147,10 +1167,20 @@ app.post("/api/clients/:id/topic-days/run-now", async (req, res) => {
   else if (req.body && req.body.topic) entry = { type: "topic", topic: req.body.topic };
   else entry = (client.topic_days || [])[0] || null;
   if (!entry || (!entry.topic && !entry.category)) return res.status(400).json({ error: "no topic or category configured/provided" });
-  if (!clientHasSession(client)) return res.status(400).json({ error: "no login profile — run: node login-once.js " + client.id });
+  // Same DASHBOARD_ONLY exception as the scheduler: on a dashboard-only
+  // instance (e.g. Render) this just queues the prompt for your local
+  // worker to pick up — no browser session needed here.
+  if (process.env.DASHBOARD_ONLY !== "1" && !clientHasSession(client)) {
+    return res.status(400).json({ error: "no login profile — run: node login-once.js " + client.id });
+  }
 
   const label = entry.type === "category" ? (feedsLib.CATEGORIES[entry.category]?.label || entry.category) : entry.topic;
-  res.json({ ok: true, message: `Topic-day test run started for "${label}" — watch server logs / the client's calendar.` });
+  res.json({
+    ok: true,
+    message: process.env.DASHBOARD_ONLY === "1"
+      ? `Fetching "${label}" and queuing the prompt — your local worker will generate the video next time it syncs.`
+      : `Topic-day test run started for "${label}" — watch server logs / the client's calendar.`
+  });
   (async () => {
     const today = localToday();
     try {
