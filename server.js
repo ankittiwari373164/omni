@@ -320,17 +320,16 @@ app.post("/api/clients/:id/products/populate-week", async (req, res) => {
     }
     const targetDates = rows.map(r => r.scheduled_date);
 
-    // REPLACE (same rule as the regular calendar generator): for each of
-    // these 7 dates, if this client already has a FINISHED/in-progress item
-    // there (done/generating/uploaded/composited), leave it alone and don't
-    // insert a duplicate. Otherwise delete whatever not-yet-produced item is
-    // there (planned/prompt_ready/error — from the AI calendar, a previous
-    // populate-week run, etc.) and replace it with the fixed product post.
+    // Switching to products mode means this client's OLD calendar (regular
+    // AI topics, RSS items, whatever) is no longer relevant — replace the
+    // client's ENTIRE not-yet-produced calendar, not just these 7 dates.
+    // Already-produced/in-progress items (done/generating/uploaded/composited)
+    // are always kept, everywhere else in this app, and that rule applies here too.
     const { data: existing } = await supabase.from("calendar_items")
-      .select("id,scheduled_date,status").eq("client_id", client.id).in("scheduled_date", targetDates);
+      .select("id,scheduled_date,status").eq("client_id", client.id);
 
     const produced = new Set((existing || []).filter(e => ["done", "generating", "uploaded", "composited"].includes(e.status)).map(e => e.scheduled_date));
-    const toDeleteIds = (existing || []).filter(e => !produced.has(e.scheduled_date)).map(e => e.id);
+    const toDeleteIds = (existing || []).filter(e => !["done", "generating", "uploaded", "composited"].includes(e.status)).map(e => e.id);
     if (toDeleteIds.length) {
       await supabase.from("calendar_items").delete().in("id", toDeleteIds);
     }
@@ -978,7 +977,8 @@ async function generateNewsItem(client, it, dateStr) {
     // convention (see calendar_items status update right before runPipeline).
     const ins = await supabase.from("calendar_items").insert({
       client_id: client.id, topic: it.title, hook: it.summary, link: it.link,
-      source: "rss", scheduled_date: dateStr, status: "planned"
+      source: "rss", scheduled_date: dateStr, status: "planned",
+      meta: { skipThemeDistillation: it._skipThemeDistillation === true }
     }).select().single();
     if (ins.error || !ins.data) {
       throw new Error(`calendar_items insert failed: ${ins.error?.message || "no row returned"}`);
@@ -1317,7 +1317,7 @@ async function promptForItem(client, item) {
       businessName: client.name, businessDetails: client.business_details, chatLink: client.chatgpt_link,
       title: item.topic, summary: item.hook, parts: partsForClient(client),
       voiceoverEnabled, voiceoverLanguage,
-      skipThemeDistillation: item.skip_theme_distillation === true
+      skipThemeDistillation: item.meta?.skipThemeDistillation === true
     });
   }
   return groqLib.generatePrompt({
@@ -1425,7 +1425,7 @@ let lastRetryDate = null;
 //   generating older than STUCK_MINUTES and not running here → restart
 //   planned / prompt_ready       → start (unless RECOVER_PLANNED=0)
 const STUCK_MINUTES    = parseInt(process.env.STUCK_MINUTES || "30", 10);
-const SWEEP_MINUTES    = parseInt(process.env.SWEEP_MINUTES || "5", 10);   // crawl every 5 min by default
+const SWEEP_MINUTES    = parseInt(process.env.SWEEP_MINUTES || "240", 10);   // crawl every 4 hours by default
 const RECOVER_PLANNED  = process.env.RECOVER_PLANNED !== "0";   // default: also start not-yet-started items
 let sweepRunning = false;
 
