@@ -1500,6 +1500,18 @@ setTimeout(() => runRecoverySweep("startup").catch(e => console.log("sweep:", e.
 // Manual trigger — force the sweep right now instead of waiting for the
 // next SWEEP_MINUTES interval. Only does anything on the LOCAL worker
 // instance (DASHBOARD_ONLY instances never sweep — see runRecoverySweep).
+// Debug helper: exactly what does THIS client have queued for TODAY,
+// straight from the table — no scrolling through 1000+ rows in Supabase.
+app.get("/api/clients/:id/calendar/today", async (req, res) => {
+  const today = localToday();
+  const { data, error } = await supabase.from("calendar_items")
+    .select("*").eq("client_id", req.params.id).eq("scheduled_date", today)
+    .order("created_at", { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ today, count: data.length, items: data });
+});
+
+app.get("/api/sweep/run-now", (req, res) => res.status(405).json({ error: "use POST" }));
 app.post("/api/sweep/run-now", async (req, res) => {
   if (process.env.DASHBOARD_ONLY === "1") {
     return res.status(400).json({ error: "This is a DASHBOARD_ONLY instance — it never runs the sweep. Trigger this on your local worker instead." });
