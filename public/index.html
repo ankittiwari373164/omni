@@ -332,7 +332,9 @@ function renderConfig(){
         <button type="button" class="btn btn-sm" onclick="addTopicDayRow()">+ Add a day/topic</button>
         <button type="button" class="btn btn-sm" onclick="generateTopicDayNow()" title="Actually generates a video using the first configured day/topic, right now">▶ Run today's generation now</button>
         <button type="button" class="btn btn-sm" onclick="forceSweepNow()" title="On your LOCAL worker: picks up any queued (prompt_ready/planned) items right now instead of waiting for the timer">⚡ Force sweep now (local worker)</button>
+        <button type="button" class="btn btn-sm" onclick="checkTodayItem()" title="Directly check the database for today's item — no Supabase digging needed">🔍 Check today's item</button>
       </div>
+      <div id="todayCheckResult" style="margin-top:8px;font-size:12px;color:var(--muted)"></div>
     </div>
 
     <div class="card">
@@ -612,6 +614,18 @@ async function generateTopicDayNow(){
     const r = await api("/api/clients/"+currentClient.id+"/topic-days/run-now", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({}) });
     toast(r.message || "Started ✓");
   }catch(e){ toast("Error: "+e.message); }
+}
+
+async function checkTodayItem(){
+  if(!currentClient) return;
+  const box = $("todayCheckResult"); box.textContent = "Checking…";
+  try{
+    const r = await api("/api/clients/"+currentClient.id+"/calendar/today");
+    if(!r.count){ box.textContent = `No calendar item found for ${r.today} yet — either it hasn't run, or the insert failed. Check server logs.`; return; }
+    box.innerHTML = r.items.map(it =>
+      `<div style="margin-top:4px">📅 ${r.today} — <b>${esc(it.topic||"(no topic)")}</b> — status: <b>${it.status}</b>${it.error?` — error: ${esc(it.error)}`:""}</div>`
+    ).join("");
+  }catch(e){ box.textContent = "Error: "+e.message; }
 }
 
 async function forceSweepNow(){
