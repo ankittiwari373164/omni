@@ -189,6 +189,8 @@ app.post("/api/clients/:id/config", upload.fields([
   if (b.fixed_prompt !== undefined) patch.fixed_prompt = b.fixed_prompt || null;
   // Fixed prompt for the per-part IMAGE generation step
   if (b.fixed_image_prompt !== undefined) patch.fixed_image_prompt = b.fixed_image_prompt || null;
+  // Skip ChatGPT image generation entirely — only paste the reference image(s).
+  if (b.reference_image_only !== undefined) patch.reference_image_only = b.reference_image_only === "true" || b.reference_image_only === true;
   // Voiceover on/off + language
   if (b.voiceover_enabled !== undefined) patch.voiceover_enabled = b.voiceover_enabled === "true" || b.voiceover_enabled === true;
   if (b.voiceover_language !== undefined) patch.voiceover_language = b.voiceover_language || "Hindi/Hinglish";
@@ -520,11 +522,17 @@ app.post("/api/clients/:id/generate", upload.fields([{ name: "image", maxCount: 
 // ====================================================================
 
 // Derive a short human title from a prompt when no topic is set (manual prompts).
+// Strips a leading "PART 1 (0-10 sec) — " style marker from ANY string,
+// wherever it came from (a clean topic, a corrupted one from before this
+// fix existed, or the raw prompt text) — so it's never possible to get a
+// video/YouTube title that starts with "PART N ...".
+function stripPartPrefix(s) {
+  return String(s || "").replace(/^PART\s*\d+\s*\([^)]*\)\s*[-–—]\s*/i, "").trim();
+}
+
 function deriveTitle(prompt) {
   const firstLine = String(prompt).split(/\n/).map(s => s.trim()).find(Boolean) || "video";
-  // Strip a leading "PART 1 (0-10 sec) — " style marker so the fallback
-  // title is just the actual short punchy title, never "PART 1 ...".
-  const noPartPrefix = firstLine.replace(/^PART\s*\d+\s*\([^)]*\)\s*[-–—]\s*/i, "").trim();
+  const noPartPrefix = stripPartPrefix(firstLine);
   const clean = (noPartPrefix || firstLine).replace(/^\*+|\*+$/g, "").replace(/[#*_`]/g, "").trim();
   const words = clean.split(/\s+/).slice(0, 10).join(" ");
   return (words || "video").slice(0, 80);
@@ -585,7 +593,7 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
     if (profileDir) sendLog(jobId, "info", "🔐 Using persistent login profile");
     prompt = groqLib.sanitizePrompt(prompt);   // safety net for manual prompts too
     const parts = groqLib.splitPromptParts(prompt);
-    const videoTitle = (topic && topic.trim()) || deriveTitle(prompt);
+    const videoTitle = stripPartPrefix((topic && topic.trim()) || deriveTitle(prompt)) || deriveTitle(prompt);
 
     sendLog(jobId, "info", `🚀 Generating for ${client.name}`);
     sendLog(jobId, "info", `📋 ${prompt.slice(0, 90)}${prompt.length > 90 ? "…" : ""}`);
@@ -616,6 +624,12 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
       async function imageForPart(i, text) {
         const fp = partImgPath(i, text);
         if (bigEnough(fp)) { sendLog(jobId, "info", `♻️ Reusing saved image for part ${i + 1}`); return fp; }
+        // Client configured to skip AI image generation entirely — only the
+        // reference image (client's or this item's) gets pasted into Flow,
+        // no ChatGPT image call at all for any part.
+        if (client.reference_image_only) {
+          return null;
+        }
         if (!process.env.CHATGPT_SERVER_URL) {
           sendLog(jobId, "warn", "CHATGPT_SERVER_URL not set — using client image");
           return null;
