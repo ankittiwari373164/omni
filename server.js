@@ -980,6 +980,9 @@ async function generateNewsItem(client, it, dateStr) {
       client_id: client.id, topic: it.title, hook: it.summary, link: it.link,
       source: "rss", scheduled_date: dateStr, status: "planned"
     }).select().single();
+    if (ins.error || !ins.data) {
+      throw new Error(`calendar_items insert failed: ${ins.error?.message || "no row returned"}`);
+    }
     ci = ins.data;
 
     // Same fixed-prompt bypass as promptForItem(): if this client is set to
