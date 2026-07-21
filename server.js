@@ -1422,7 +1422,7 @@ let lastRetryDate = null;
 //   generating older than STUCK_MINUTES and not running here → restart
 //   planned / prompt_ready       → start (unless RECOVER_PLANNED=0)
 const STUCK_MINUTES    = parseInt(process.env.STUCK_MINUTES || "30", 10);
-const SWEEP_MINUTES    = parseInt(process.env.SWEEP_MINUTES || "240", 10);   // crawl every 4 hours
+const SWEEP_MINUTES    = parseInt(process.env.SWEEP_MINUTES || "5", 10);   // crawl every 5 min by default
 const RECOVER_PLANNED  = process.env.RECOVER_PLANNED !== "0";   // default: also start not-yet-started items
 let sweepRunning = false;
 
@@ -1496,6 +1496,17 @@ async function retryFailedForToday() { return runRecoverySweep("afternoon"); }
 // startup so a power-cut/reboot resumes today's unfinished work immediately.
 setInterval(() => runRecoverySweep("scheduled").catch(e => console.log("sweep:", e.message)), SWEEP_MINUTES * 60 * 1000);
 setTimeout(() => runRecoverySweep("startup").catch(e => console.log("sweep:", e.message)), 60 * 1000);
+
+// Manual trigger — force the sweep right now instead of waiting for the
+// next SWEEP_MINUTES interval. Only does anything on the LOCAL worker
+// instance (DASHBOARD_ONLY instances never sweep — see runRecoverySweep).
+app.post("/api/sweep/run-now", async (req, res) => {
+  if (process.env.DASHBOARD_ONLY === "1") {
+    return res.status(400).json({ error: "This is a DASHBOARD_ONLY instance — it never runs the sweep. Trigger this on your local worker instead." });
+  }
+  res.json({ ok: true, message: "Sweep started — watch the local terminal." });
+  runRecoverySweep("manual").catch(e => console.log("sweep:", e.message));
+});
 
 // Time-gated trigger: check every 15 min; fire once per day at/after RETRY_HOUR.
 setInterval(() => {
