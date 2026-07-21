@@ -318,18 +318,28 @@ app.post("/api/clients/:id/products/populate-week", async (req, res) => {
         reference_image: img, status: "planned"
       });
     }
+    const targetDates = rows.map(r => r.scheduled_date);
 
-    // Don't duplicate a date that already has an item for this client.
+    // REPLACE (same rule as the regular calendar generator): for each of
+    // these 7 dates, if this client already has a FINISHED/in-progress item
+    // there (done/generating/uploaded/composited), leave it alone and don't
+    // insert a duplicate. Otherwise delete whatever not-yet-produced item is
+    // there (planned/prompt_ready/error — from the AI calendar, a previous
+    // populate-week run, etc.) and replace it with the fixed product post.
     const { data: existing } = await supabase.from("calendar_items")
-      .select("scheduled_date").eq("client_id", client.id)
-      .in("scheduled_date", rows.map(r => r.scheduled_date));
-    const already = new Set((existing || []).map(e => e.scheduled_date));
-    const fresh = rows.filter(r => !already.has(r.scheduled_date));
+      .select("id,scheduled_date,status").eq("client_id", client.id).in("scheduled_date", targetDates);
 
-    if (!fresh.length) return res.json({ inserted: 0, message: "This week is already populated." });
+    const produced = new Set((existing || []).filter(e => ["done", "generating", "uploaded", "composited"].includes(e.status)).map(e => e.scheduled_date));
+    const toDeleteIds = (existing || []).filter(e => !produced.has(e.scheduled_date)).map(e => e.id);
+    if (toDeleteIds.length) {
+      await supabase.from("calendar_items").delete().in("id", toDeleteIds);
+    }
+
+    const fresh = rows.filter(r => !produced.has(r.scheduled_date));
+    if (!fresh.length) return res.json({ inserted: 0, message: "Every day this week already has a finished/in-progress video — nothing to replace." });
     const { data, error } = await supabase.from("calendar_items").insert(fresh).select();
     if (error) throw error;
-    res.json({ inserted: data.length, items: data });
+    res.json({ inserted: data.length, items: data, skipped: rows.length - fresh.length });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -972,13 +982,22 @@ async function generateNewsItem(client, it, dateStr) {
     }).select().single();
     ci = ins.data;
 
-    const prompt = await groqLib.generateNewsPrompt({
-      businessName: client.name, businessDetails: client.business_details, chatLink: client.chatgpt_link,
-      title: it.title, summary: it.summary, parts: partsForClient(client),
-      voiceoverEnabled: client.voiceover_enabled !== false,
-      voiceoverLanguage: client.voiceover_language || "Hindi/Hinglish",
-      skipThemeDistillation: it._skipThemeDistillation === true
-    });
+    // Same fixed-prompt bypass as promptForItem(): if this client is set to
+    // always use one exact prompt, skip ChatGPT entirely — for RSS/topic-day
+    // items too, not just the regular AI calendar. (The fetched article
+    // still drove which day/whether this ran; only the PROMPT TEXT is fixed.)
+    let prompt;
+    if (client.fixed_prompt_mode && client.fixed_prompt && String(client.fixed_prompt).trim()) {
+      prompt = String(client.fixed_prompt).trim();
+    } else {
+      prompt = await groqLib.generateNewsPrompt({
+        businessName: client.name, businessDetails: client.business_details, chatLink: client.chatgpt_link,
+        title: it.title, summary: it.summary, parts: partsForClient(client),
+        voiceoverEnabled: client.voiceover_enabled !== false,
+        voiceoverLanguage: client.voiceover_language || "Hindi/Hinglish",
+        skipThemeDistillation: it._skipThemeDistillation === true
+      });
+    }
     await supabase.from("calendar_items").update({ prompt, status: "prompt_ready" }).eq("id", ci.id);
 
     if (process.env.DASHBOARD_ONLY === "1") {
@@ -1113,6 +1132,26 @@ async function resolveDayEntryArticle(client, entry) {
   return article ? { ...article, _label: topic } : null;
 }
 
+// Topic-days represent "exactly ONE plan for this weekday" (unlike regular
+// RSS mode, which intentionally makes several items/day). So when a
+// topic-day fires, it should REPLACE whatever calendar item this client
+// already has for today (a generic AI-calendar item, a leftover from a
+// previous run, etc.) rather than sit alongside it as a duplicate — but
+// only if today's existing item isn't already produced/in-progress.
+// Returns true if it's safe to proceed with generateNewsItem, false if
+// today's slot is already finished/running (so we skip, not duplicate).
+async function overrideTodayForTopicDay(client, today) {
+  const { data: existing } = await supabase.from("calendar_items")
+    .select("id,status").eq("client_id", client.id).eq("scheduled_date", today);
+  if (!existing || !existing.length) return true;
+
+  const stillSafe = existing.every(e => !["done", "generating", "uploaded", "composited"].includes(e.status));
+  if (!stillSafe) return false; // already produced/running today — don't touch or duplicate
+
+  await supabase.from("calendar_items").delete().in("id", existing.map(e => e.id));
+  return true;
+}
+
 async function runTopicDaysScheduler() {
   const today = localToday();
   const todayName = WEEKDAY_NAMES[new Date().getDay()];
@@ -1143,15 +1182,20 @@ async function runTopicDaysScheduler() {
         .select("id").eq("client_id", client.id).eq("link", article.link).limit(1);
       if (existing && existing.length) { console.log(`📌 Topic-day [${client.name}] "${article._label}": already produced this article`); }
       else {
-        console.log(`📌 Topic-day [${client.name}] "${article._label}": ${article.title}`);
-        // The day's label (topic OR category) is already an evergreen,
-        // brand-chosen concept, so skip the news-headline distillation pass,
-        // but still run through generatePrompt's full safety/policy rules.
-        await generateNewsItem(
-          client,
-          { title: article._label, summary: article.summary, link: article.link, _skipThemeDistillation: true },
-          today
-        );
+        const canProceed = await overrideTodayForTopicDay(client, today);
+        if (!canProceed) {
+          console.log(`📌 Topic-day [${client.name}]: today's slot is already produced/running — skipping, not duplicating`);
+        } else {
+          console.log(`📌 Topic-day [${client.name}] "${article._label}": ${article.title}`);
+          // The day's label (topic OR category) is already an evergreen,
+          // brand-chosen concept, so skip the news-headline distillation pass,
+          // but still run through generatePrompt's full safety/policy rules.
+          await generateNewsItem(
+            client,
+            { title: article._label, summary: article.summary, link: article.link, _skipThemeDistillation: true },
+            today
+          );
+        }
       }
       await supabase.from("clients").update({ last_topic_run: today }).eq("id", client.id);
     } catch (e) {
@@ -1220,6 +1264,8 @@ app.post("/api/clients/:id/topic-days/run-now", async (req, res) => {
       const article = await resolveDayEntryArticle(client, entry);
       if (!article) return console.log(`[run-now topic-day] no article found for "${label}"`);
       console.log(`[run-now topic-day] found article: ${article.title} (${article.link})`);
+      const canProceed = await overrideTodayForTopicDay(client, today);
+      if (!canProceed) return console.log(`[run-now topic-day] today's slot is already produced/running for ${client.name} — skipping, not duplicating`);
       await generateNewsItem(client, { title: article._label, summary: article.summary, link: article.link, _skipThemeDistillation: true }, today);
       console.log(`[run-now topic-day] generateNewsItem finished for ${client.name}`);
     } catch (e) { console.log(`[run-now topic-day] error (${client.name}):`, e.message); }
@@ -1243,8 +1289,12 @@ function partsForClient(client) {
 
 async function promptForItem(client, item) {
   // 1) Client configured to ALWAYS use one fixed prompt — never calls ChatGPT
-  //    for the video prompt at all.
-  if (client.fixed_prompt_mode && client.fixed_prompt && String(client.fixed_prompt).trim()) {
+  //    for the video prompt at all. Also applies automatically in "products"
+  //    mode, since that mode is defined as "one fixed prompt for every day"
+  //    — no need to separately toggle fixed_prompt_mode too.
+  const useFixedPrompt = (client.fixed_prompt_mode || client.mode === "products")
+    && client.fixed_prompt && String(client.fixed_prompt).trim();
+  if (useFixedPrompt) {
     return String(client.fixed_prompt).trim();
   }
 
