@@ -733,8 +733,9 @@ function renderCalList(items){
     <div class="cal-item">
       <div class="cal-date">${it.scheduled_date||""}</div>
       <div class="cal-body">
-        <div class="cal-topic">${esc(it.topic)} <span class="pill ${it.status==='done'?'green':it.status==='prompt_ready'?'accent':it.status==='generating'?'gold':''}">${it.status}</span></div>
+        <div class="cal-topic">${esc(it.topic)} <span class="pill ${it.status==='done'?'green':it.status==='prompt_ready'?'accent':it.status==='generating'?'gold':it.status==='error'?'red':''}">${it.status}</span>${it.source==='rss'?' <span class="pill" style="opacity:.7">📰 article-based</span>':''}</div>
         ${it.hook?`<div class="cal-hook">${esc(it.hook)}</div>`:""}
+        ${it.status==='error' && it.error?`<div class="cal-hook" style="color:var(--red,#e33)">⚠ ${esc(it.error)}</div>`:""}
         ${it.prompt?`<div class="cal-prompt">${esc(it.prompt)}</div>`:""}
         <div class="btn-row">
           <button class="btn btn-sm" onclick="makePrompt('${it.id}')">${it.prompt?'Regenerate':'Make'} prompt</button>
