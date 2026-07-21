@@ -1673,9 +1673,38 @@ app.get("/api/oauth/google/callback", async (req, res) => {
   }
 });
 
+// One-time cleanup: strip "PART N (...) — " corruption out of any topic
+// values already sitting in the database from before this fix existed.
+// Doesn't touch already-uploaded YouTube videos (can't edit those), but
+// prevents the bad string from resurfacing anywhere it's reused (Calendar
+// tab, regenerate, etc). Safe to run repeatedly — it's a no-op once clean.
+app.post("/api/admin/clean-part-prefixes", async (req, res) => {
+  try {
+    const { data: rows, error } = await supabase.from("calendar_items").select("id,topic").not("topic", "is", null);
+    if (error) throw error;
+    const bad = (rows || []).filter(r => /^PART\s*\d+\s*\([^)]*\)\s*[-–—]\s*/i.test(r.topic || ""));
+    for (const r of bad) {
+      const cleaned = stripPartPrefix(r.topic) || r.topic;
+      await supabase.from("calendar_items").update({ topic: cleaned }).eq("id", r.id);
+    }
+    res.json({ scanned: (rows || []).length, cleaned: bad.length, examples: bad.slice(0, 5).map(r => r.topic) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// BUILD STAMP — bump this string every time you get a new server.js from
+// me. Printed at startup AND available at GET /api/build so you can check
+// a running instance from the browser without SSH/terminal access, and
+// confirm definitively whether it's actually running the latest fixes
+// (e.g. the "PART 1" title strip) before assuming a bug is still live.
+const BUILD_STAMP = "2026-07-21-titlefix-refimgtoggle-1";
+app.get("/api/build", (req, res) => res.json({ build: BUILD_STAMP, dashboardOnly: process.env.DASHBOARD_ONLY === "1" }));
+
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
   console.log(`🎬  Flow Studio → http://localhost:${PORT}`);
+  console.log(`🏷️  build: ${BUILD_STAMP}${process.env.DASHBOARD_ONLY === "1" ? " (DASHBOARD_ONLY)" : " (worker)"}`);
   const miss = [];
   if (!process.env.SUPABASE_URL) miss.push("SUPABASE_URL");
   if (!process.env.SUPABASE_SERVICE_KEY) miss.push("SUPABASE_SERVICE_KEY");
