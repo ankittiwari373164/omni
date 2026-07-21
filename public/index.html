@@ -331,6 +331,7 @@ function renderConfig(){
       <div class="btn-row" style="margin-top:6px">
         <button type="button" class="btn btn-sm" onclick="addTopicDayRow()">+ Add a day/topic</button>
         <button type="button" class="btn btn-sm" onclick="generateTopicDayNow()" title="Actually generates a video using the first configured day/topic, right now">▶ Run today's generation now</button>
+        <button type="button" class="btn btn-sm" onclick="forceSweepNow()" title="On your LOCAL worker: picks up any queued (prompt_ready/planned) items right now instead of waiting for the timer">⚡ Force sweep now (local worker)</button>
       </div>
     </div>
 
@@ -610,6 +611,13 @@ async function generateTopicDayNow(){
   try{
     const r = await api("/api/clients/"+currentClient.id+"/topic-days/run-now", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({}) });
     toast(r.message || "Started ✓");
+  }catch(e){ toast("Error: "+e.message); }
+}
+
+async function forceSweepNow(){
+  try{
+    const r = await api("/api/sweep/run-now", { method:"POST" });
+    toast(r.message || "Sweep started ✓");
   }catch(e){ toast("Error: "+e.message); }
 }
 
