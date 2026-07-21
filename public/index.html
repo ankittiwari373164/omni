@@ -302,6 +302,8 @@ function renderConfig(){
         <div class="hint">Used verbatim, no ChatGPT call, when the toggle above is on. Also used automatically in "Products only" mode.</div></div>
       <div class="field"><label>Fixed image-generation prompt (optional)</label>
         <textarea id="cfgFixedImagePrompt" placeholder="If set, this exact text is used to generate the reference image for every part, instead of text derived from each scene.">${esc(c.fixed_image_prompt||"")}</textarea></div>
+      <label class="toggle"><input type="checkbox" id="cfgReferenceImageOnly" ${c.reference_image_only?'checked':''}> Don't generate images with ChatGPT — only use the reference image(s) I've provided</label>
+      <div class="hint" style="margin:2px 0 0 24px">Skips the per-part ChatGPT image call entirely for every video. Only the client's uploaded reference image (Config → reference image, or the product-mode image for that day) gets pasted into Flow.</div>
     </div>
 
     <div class="card">
@@ -529,6 +531,7 @@ async function saveConfig(){
     if($("cfgFixedPromptMode")) fd.append("fixed_prompt_mode", $("cfgFixedPromptMode").checked);
     if($("cfgFixedPrompt")) fd.append("fixed_prompt", $("cfgFixedPrompt").value);
     if($("cfgFixedImagePrompt")) fd.append("fixed_image_prompt", $("cfgFixedImagePrompt").value);
+    if($("cfgReferenceImageOnly")) fd.append("reference_image_only", $("cfgReferenceImageOnly").checked);
     if($("cfgVoiceoverEnabled")) fd.append("voiceover_enabled", $("cfgVoiceoverEnabled").checked);
     if($("cfgVoiceoverLanguage")) fd.append("voiceover_language", $("cfgVoiceoverLanguage").value);
     // day-fixed monthly topics
