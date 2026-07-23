@@ -1483,6 +1483,19 @@ async function runRecoverySweep(reason = "scheduled") {
         if (!client || client.active === false) continue;
         if (!clientHasSession(client)) { console.log(`  ⏭️ ${client.name}: no login profile`); continue; }
 
+        // TOPIC-DAY PRIORITY: if today is one of this client's configured
+        // topic-days, the article pipeline OWNS today — don't generate the
+        // regular calendar's planned item for this date (the topic-day
+        // scheduler will delete/replace it). Only article-based (source=rss)
+        // items proceed on such days.
+        const todayName = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][new Date().getDay()];
+        const hasTopicDayToday = Array.isArray(client.topic_days) &&
+          client.topic_days.some(e => e && e.day === todayName && (e.topic || e.category));
+        if (hasTopicDayToday && item.source !== "rss" && ["planned", "prompt_ready"].includes(item.status)) {
+          console.log(`  ⏭️ ${client.name}: topic-day owns ${today} — skipping regular calendar item "${item.topic}"`);
+          continue;
+        }
+
         // Retire any orphaned video rows for this item (from the killed run).
         await supabase.from("videos").update({ status: "error", error: "orphaned — restarted by recovery sweep" })
           .eq("calendar_item_id", item.id).eq("status", "generating");
