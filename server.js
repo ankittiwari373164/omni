@@ -435,15 +435,22 @@ app.post("/api/clients/:id/generate", upload.fields([{ name: "image", maxCount: 
     const calItemId = req.body.calendar_item_id || null;
     let topic = req.body.topic || "";
 
+    // FIXED-PROMPT MODE WINS here too: even if the item has a stored
+    // ChatGPT prompt (from before the toggle was enabled), or the request
+    // body carries one, a fixed-prompt client always uses the fixed prompt.
+    const fixedActive = (client.fixed_prompt_mode || client.mode === "products")
+      && client.fixed_prompt && String(client.fixed_prompt).trim();
+
     if (!prompt && calItemId) {
       const { data: item } = await supabase.from("calendar_items").select("*").eq("id", calItemId).single();
       prompt = item?.prompt;
       topic = item?.topic || topic;
-      if (!prompt) {
+      if (!prompt && !fixedActive) {
         prompt = await promptForItem(client, item);
         await supabase.from("calendar_items").update({ prompt, status: "prompt_ready" }).eq("id", calItemId);
       }
     }
+    if (fixedActive) prompt = String(client.fixed_prompt).trim();
     if (!prompt) return res.status(400).json({ error: "prompt or calendar_item_id required" });
 
     // write cookies to a temp file for the playwright script
@@ -1500,7 +1507,15 @@ async function runRecoverySweep(reason = "scheduled") {
         await supabase.from("videos").update({ status: "error", error: "orphaned — restarted by recovery sweep" })
           .eq("calendar_item_id", item.id).eq("status", "generating");
 
-        const prompt = (item.prompt && item.prompt.trim()) ? item.prompt : await promptForItem(client, item);
+        // FIXED-PROMPT MODE WINS: if the client is set to always use one
+        // exact prompt, ignore any previously-stored ChatGPT prompt on the
+        // item (e.g. generated before the toggle was turned on) and use the
+        // fixed prompt. Otherwise: reuse the stored prompt, or build one.
+        const fixedActive = (client.fixed_prompt_mode || client.mode === "products")
+          && client.fixed_prompt && String(client.fixed_prompt).trim();
+        const prompt = fixedActive
+          ? String(client.fixed_prompt).trim()
+          : ((item.prompt && item.prompt.trim()) ? item.prompt : await promptForItem(client, item));
         await supabase.from("calendar_items")
           .update({ status: "generating", prompt, error: null, updated_at: new Date().toISOString() })
           .eq("id", item.id);
