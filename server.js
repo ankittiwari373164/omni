@@ -800,7 +800,16 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
           const hashtags = (client.yt_hashtags
             ? client.yt_hashtags.split(",").map(h => h.trim()).filter(Boolean).map(h => h.startsWith("#") ? h : "#" + h).join(" ")
             : (meta.hashtags || ""));
-          const title = applyTpl(client.yt_title_tpl, { title: videoTitle, topic: videoTitle, client: client.name, hashtags }) || videoTitle;
+          // FIXED-PROMPT clients: videoTitle would be the first words of the
+          // instruction prompt (e.g. "make a 10 sec clip with this...") — not
+          // a real title. Use ChatGPT's freshly-generated meta.title instead,
+          // which is different every upload. Normal clients keep their topic.
+          const fixedTitleActive = (client.fixed_prompt_mode || client.mode === "products")
+            && client.fixed_prompt && String(client.fixed_prompt).trim();
+          const baseTitle = (fixedTitleActive && meta.title && meta.title.trim())
+            ? stripPartPrefix(meta.title.trim()).slice(0, 95)
+            : videoTitle;
+          const title = applyTpl(client.yt_title_tpl, { title: baseTitle, topic: baseTitle, client: client.name, hashtags }) || baseTitle;
           const descBase = applyTpl(client.yt_desc_tpl, { description: meta.description, client: client.name, hashtags })
             || meta.description || "";
           const description = `${descBase}\n\n${hashtags}`.trim();
@@ -1555,58 +1564,99 @@ setTimeout(() => runRecoverySweep("startup").catch(e => console.log("sweep:", e.
 // next SWEEP_MINUTES interval. Only does anything on the LOCAL worker
 // instance (DASHBOARD_ONLY instances never sweep — see runRecoverySweep).
 // Manual re-push: upload an already-composited video to Drive and/or YouTube
-// when the automatic upload failed (expired token, quota, network). Runs on
-// the LOCAL worker (the video file lives on its disk).
+// when the automatic upload failed. On the LOCAL worker it uploads directly;
+// on a DASHBOARD_ONLY instance (Render) it QUEUES the push (push_requested
+// column) and the local worker's relay executes it within ~60s.
+
+async function executePush(v, client, target) {
+  const candidates = [v.final_file, v.raw_file].filter(Boolean);
+  if (!candidates.length) throw new Error("no video file recorded for this row");
+  let full = null;
+  for (const c of candidates) {
+    const p = path.join(__dirname, "outputs", c);
+    if (fs.existsSync(p)) { full = p; break; }
+  }
+  if (!full) throw new Error(`video file(s) not found on this machine (${candidates.join(", ")}) — generation errored before the file was finished; regenerate instead of pushing.`);
+
+  const out = {};
+  const title = stripPartPrefix(v.title || "video");
+
+  if ((target === "drive" || target === "both") && !v.drive_url) {
+    const driveTokens = await getSetting("drive_tokens");
+    if (!driveTokens) out.drive = "no global Drive connection";
+    else {
+      const link = await googleLib.uploadToDrive({
+        tokens: driveTokens, filePath: full, fileName: `${title}.mp4`,
+        folderName: client?.drive_folder || client?.name || "FlowStudio",
+        onTokens: (fresh) => { setSetting("drive_tokens", fresh).catch(() => {}); }
+      });
+      await supabase.from("videos").update({ drive_url: link }).eq("id", v.id);
+      out.drive = link;
+    }
+  }
+
+  if ((target === "youtube" || target === "both") && !v.youtube_url) {
+    if (!client?.youtube_tokens) out.youtube = "YouTube not connected for this client — reconnect in Config";
+    else {
+      const hashtags = client.yt_hashtags
+        ? client.yt_hashtags.split(",").map(h => h.trim()).filter(Boolean).map(h => h.startsWith("#") ? h : "#" + h).join(" ")
+        : "";
+      const yt = await googleLib.uploadToYouTube({
+        tokens: client.youtube_tokens, filePath: full,
+        title: applyTpl(client.yt_title_tpl, { title, topic: title, client: client.name, hashtags }) || title,
+        description: `${applyTpl(client.yt_desc_tpl, { description: v.description || "", client: client.name, hashtags }) || v.description || title}\n\n${hashtags}`.trim(),
+        tags: (client.yt_tags || "").split(",").map(t => t.trim()).filter(Boolean),
+        onTokens: (fresh) => { supabase.from("clients").update({ youtube_tokens: fresh }).eq("id", client.id).then(() => {}); }
+      });
+      await supabase.from("videos").update({ youtube_url: yt, status: "uploaded" }).eq("id", v.id);
+      out.youtube = yt;
+    }
+  }
+  return out;
+}
+
 app.post("/api/videos/:id/push", async (req, res) => {
   try {
     const { data: v } = await supabase.from("videos").select("*").eq("id", req.params.id).single();
     if (!v) return res.status(404).json({ error: "video not found" });
+    const target = (req.body && req.body.target) || "both";
+
+    if (process.env.DASHBOARD_ONLY === "1") {
+      // Render: queue it — the local worker's relay picks it up within ~60s.
+      await supabase.from("videos").update({ push_requested: target }).eq("id", v.id);
+      return res.json({ ok: true, queued: true, message: "Push queued — your local worker will upload it within a minute (if it's running)." });
+    }
+
     const { data: client } = await supabase.from("clients").select("*").eq("id", v.client_id).single();
-    const file = v.final_file || v.raw_file;
-    if (!file) return res.status(400).json({ error: "no video file recorded for this row" });
-    const full = path.join(__dirname, "outputs", file);
-    if (!fs.existsSync(full)) return res.status(400).json({ error: `file not on this machine (${file}) — run this on the local worker` });
-
-    const target = (req.body && req.body.target) || "both"; // "drive" | "youtube" | "both"
-    const out = {};
-    const title = stripPartPrefix(v.title || "video");
-
-    if ((target === "drive" || target === "both") && !v.drive_url) {
-      const driveTokens = await getSetting("drive_tokens");
-      if (!driveTokens) out.drive = "no global Drive connection";
-      else {
-        const link = await googleLib.uploadToDrive({
-          tokens: driveTokens, filePath: full, fileName: `${title}.mp4`,
-          folderName: client?.drive_folder || client?.name || "FlowStudio",
-          onTokens: (fresh) => { setSetting("drive_tokens", fresh).catch(() => {}); }
-        });
-        await supabase.from("videos").update({ drive_url: link }).eq("id", v.id);
-        out.drive = link;
-      }
-    }
-
-    if ((target === "youtube" || target === "both") && !v.youtube_url) {
-      if (!client?.youtube_tokens) out.youtube = "YouTube not connected for this client — reconnect in Config";
-      else {
-        const hashtags = client.yt_hashtags
-          ? client.yt_hashtags.split(",").map(h => h.trim()).filter(Boolean).map(h => h.startsWith("#") ? h : "#" + h).join(" ")
-          : "";
-        const yt = await googleLib.uploadToYouTube({
-          tokens: client.youtube_tokens, filePath: full,
-          title: applyTpl(client.yt_title_tpl, { title, topic: title, client: client.name, hashtags }) || title,
-          description: `${applyTpl(client.yt_desc_tpl, { description: v.description || "", client: client.name, hashtags }) || v.description || title}\n\n${hashtags}`.trim(),
-          tags: (client.yt_tags || "").split(",").map(t => t.trim()).filter(Boolean),
-          onTokens: (fresh) => { supabase.from("clients").update({ youtube_tokens: fresh }).eq("id", client.id).then(() => {}); }
-        });
-        await supabase.from("videos").update({ youtube_url: yt, status: "uploaded" }).eq("id", v.id);
-        out.youtube = yt;
-      }
-    }
+    const out = await executePush(v, client, target);
+    await supabase.from("videos").update({ push_requested: null }).eq("id", v.id);
     res.json({ ok: true, ...out });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
+
+// PUSH RELAY (local worker only): every 60s, execute pushes queued from the
+// Render dashboard. Light — one indexed query; no-op when nothing queued.
+if (process.env.DASHBOARD_ONLY !== "1") {
+  setInterval(async () => {
+    try {
+      const { data: queued } = await supabase.from("videos").select("*").not("push_requested", "is", null).limit(5);
+      for (const v of (queued || [])) {
+        const { data: client } = await supabase.from("clients").select("*").eq("id", v.client_id).single();
+        try {
+          const out = await executePush(v, client, v.push_requested);
+          console.log(`⤴ push relay: ${v.title || v.id} →`, JSON.stringify(out));
+        } catch (e) {
+          console.log(`⤴ push relay failed for ${v.id}: ${e.message}`);
+        }
+        // Clear the flag either way so a broken video doesn't retry forever;
+        // the error is logged above and the card still shows no link.
+        await supabase.from("videos").update({ push_requested: null }).eq("id", v.id);
+      }
+    } catch (e) { /* transient DB errors: try again next minute */ }
+  }, 60 * 1000);
+}
 
 // Debug helper: exactly what does THIS client have queued for TODAY,
 // straight from the table — no scrolling through 1000+ rows in Supabase.
