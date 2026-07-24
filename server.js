@@ -1554,6 +1554,60 @@ setTimeout(() => runRecoverySweep("startup").catch(e => console.log("sweep:", e.
 // Manual trigger — force the sweep right now instead of waiting for the
 // next SWEEP_MINUTES interval. Only does anything on the LOCAL worker
 // instance (DASHBOARD_ONLY instances never sweep — see runRecoverySweep).
+// Manual re-push: upload an already-composited video to Drive and/or YouTube
+// when the automatic upload failed (expired token, quota, network). Runs on
+// the LOCAL worker (the video file lives on its disk).
+app.post("/api/videos/:id/push", async (req, res) => {
+  try {
+    const { data: v } = await supabase.from("videos").select("*").eq("id", req.params.id).single();
+    if (!v) return res.status(404).json({ error: "video not found" });
+    const { data: client } = await supabase.from("clients").select("*").eq("id", v.client_id).single();
+    const file = v.final_file || v.raw_file;
+    if (!file) return res.status(400).json({ error: "no video file recorded for this row" });
+    const full = path.join(__dirname, "outputs", file);
+    if (!fs.existsSync(full)) return res.status(400).json({ error: `file not on this machine (${file}) — run this on the local worker` });
+
+    const target = (req.body && req.body.target) || "both"; // "drive" | "youtube" | "both"
+    const out = {};
+    const title = stripPartPrefix(v.title || "video");
+
+    if ((target === "drive" || target === "both") && !v.drive_url) {
+      const driveTokens = await getSetting("drive_tokens");
+      if (!driveTokens) out.drive = "no global Drive connection";
+      else {
+        const link = await googleLib.uploadToDrive({
+          tokens: driveTokens, filePath: full, fileName: `${title}.mp4`,
+          folderName: client?.drive_folder || client?.name || "FlowStudio",
+          onTokens: (fresh) => { setSetting("drive_tokens", fresh).catch(() => {}); }
+        });
+        await supabase.from("videos").update({ drive_url: link }).eq("id", v.id);
+        out.drive = link;
+      }
+    }
+
+    if ((target === "youtube" || target === "both") && !v.youtube_url) {
+      if (!client?.youtube_tokens) out.youtube = "YouTube not connected for this client — reconnect in Config";
+      else {
+        const hashtags = client.yt_hashtags
+          ? client.yt_hashtags.split(",").map(h => h.trim()).filter(Boolean).map(h => h.startsWith("#") ? h : "#" + h).join(" ")
+          : "";
+        const yt = await googleLib.uploadToYouTube({
+          tokens: client.youtube_tokens, filePath: full,
+          title: applyTpl(client.yt_title_tpl, { title, topic: title, client: client.name, hashtags }) || title,
+          description: `${applyTpl(client.yt_desc_tpl, { description: v.description || "", client: client.name, hashtags }) || v.description || title}\n\n${hashtags}`.trim(),
+          tags: (client.yt_tags || "").split(",").map(t => t.trim()).filter(Boolean),
+          onTokens: (fresh) => { supabase.from("clients").update({ youtube_tokens: fresh }).eq("id", client.id).then(() => {}); }
+        });
+        await supabase.from("videos").update({ youtube_url: yt, status: "uploaded" }).eq("id", v.id);
+        out.youtube = yt;
+      }
+    }
+    res.json({ ok: true, ...out });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Debug helper: exactly what does THIS client have queued for TODAY,
 // straight from the table — no scrolling through 1000+ rows in Supabase.
 app.get("/api/clients/:id/calendar/today", async (req, res) => {
