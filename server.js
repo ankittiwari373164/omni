@@ -1478,6 +1478,15 @@ async function runRecoverySweep(reason = "scheduled") {
     });
     if (!todo.length) { console.log(`🧹 sweep (${reason}): ${items.length} pending, none stale/ready yet`); return; }
 
+    // PRIORITY: article-based items (topic-days / RSS, source="rss") jump
+    // ahead of regular calendar items — news is time-sensitive, evergreen
+    // calendar topics can wait a cycle. Within each group, keep date order.
+    todo.sort((a, b) => {
+      const pa = a.source === "rss" ? 0 : 1;
+      const pb = b.source === "rss" ? 0 : 1;
+      return pa - pb;
+    });
+
     console.log(`🧹 sweep (${reason}): resuming ${todo.length} item(s) for ${today}`);
     const clientCache = {};
     for (const item of todo) {
