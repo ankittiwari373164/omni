@@ -853,7 +853,7 @@ function stopLogPolling(){ if(logPoll){clearInterval(logPoll); logPoll=null;} }
 async function pushVideo(id, target){
   try{
     const r = await api("/api/videos/"+id+"/push", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({target})});
-    toast(r[target] ? ("Pushed ✓ " + r[target]) : (r.error || JSON.stringify(r)));
+    toast(r.queued ? r.message : (r[target] ? ("Pushed ✓ " + r[target]) : (r.error || JSON.stringify(r))));
     renderVideos();
   }catch(e){ toast("Push failed: "+e.message); }
 }
