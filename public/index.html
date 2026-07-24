@@ -850,6 +850,14 @@ function startLogPolling(clientId){
 function stopLogPolling(){ if(logPoll){clearInterval(logPoll); logPoll=null;} }
 
 // ---------- VIDEOS ----------
+async function pushVideo(id, target){
+  try{
+    const r = await api("/api/videos/"+id+"/push", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({target})});
+    toast(r[target] ? ("Pushed ✓ " + r[target]) : (r.error || JSON.stringify(r)));
+    renderVideos();
+  }catch(e){ toast("Push failed: "+e.message); }
+}
+
 async function renderVideos(){
   $("content").innerHTML='<div class="hint">Loading…</div>';
   const vids=await api("/api/clients/"+currentClient.id+"/videos");
@@ -865,6 +873,8 @@ async function renderVideos(){
           ${v.drive_url?`<a href="${esc(v.drive_url)}" target="_blank">📁 Drive</a>`:""}
           ${v.youtube_url?`<a href="${esc(v.youtube_url)}" target="_blank">📺 YouTube</a>`:""}
           ${file?`<a href="/outputs/${esc(file)}" download>⬇ Download</a>`:""}
+          ${file&&!v.drive_url?`<a href="#" onclick="pushVideo('${v.id}','drive');return false">⤴ Push Drive</a>`:""}
+          ${file&&!v.youtube_url?`<a href="#" onclick="pushVideo('${v.id}','youtube');return false">⤴ Push YT</a>`:""}
         </div>
       </div></div>`;
   }).join("")+`</div>`;
