@@ -549,7 +549,7 @@ async function saveConfig(){
   }catch(e){ toast("Error: "+e.message); }
   btn.disabled=false; btn.textContent="Save config";
 }
-const WEEKDAY_OPTS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+const WEEKDAY_OPTS = ["All","Mon","Tue","Wed","Thu","Fri","Sat","Sun"]; // "All" = fires every day
 let TOPIC_DAY_CATEGORIES = [];
 async function ensureTopicDayCategories(){
   if(TOPIC_DAY_CATEGORIES.length) return TOPIC_DAY_CATEGORIES;
@@ -584,7 +584,7 @@ async function renderTopicDays(rows){
 }
 async function addTopicDayRow(){
   await ensureTopicDayCategories();
-  renderTopicDays([...collectTopicDays(), { day: "Mon", type: "topic", topic: "" }]);
+  renderTopicDays([...collectTopicDays(), { day: "All", type: "topic", topic: "" }]);
 }
 function collectTopicDays(){
   return [...document.querySelectorAll("#topicDaysBox .topic-day-row")].map(row=>{
