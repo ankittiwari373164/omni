@@ -517,7 +517,7 @@ app.post("/api/clients/:id/generate", upload.fields([{ name: "image", maxCount: 
 
     if (calItemId) await supabase.from("calendar_items").update({ status: "generating", updated_at: new Date().toISOString() }).eq("id", calItemId);
 
-    runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, topic });
+    runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, topic, preferMetaTitle: !!link });
   } catch (e) {
     generationBusy = false;   // release lock if we failed before the pipeline took over
     res.status(500).json({ error: e.message });
@@ -588,7 +588,7 @@ function generatePart({ jobId, partIndex, cookiesPath, profileDir, imagePath, im
   });
 }
 
-function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, topic, onComplete }) {
+function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, topic, preferMetaTitle, onComplete }) {
   generationBusy = true;
   (async () => {
     sendLog(jobId, "info", `🧭 pipeline build: PER-PART-IMAGES v4 — file: ${__filename}`);
@@ -806,7 +806,7 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
           // which is different every upload. Normal clients keep their topic.
           const fixedTitleActive = (client.fixed_prompt_mode || client.mode === "products")
             && client.fixed_prompt && String(client.fixed_prompt).trim();
-          const baseTitle = (fixedTitleActive && meta.title && meta.title.trim())
+          const baseTitle = ((fixedTitleActive || preferMetaTitle) && meta.title && meta.title.trim())
             ? stripPartPrefix(meta.title.trim()).slice(0, 95)
             : videoTitle;
           const title = applyTpl(client.yt_title_tpl, { title: baseTitle, topic: baseTitle, client: client.name, hashtags }) || baseTitle;
@@ -889,7 +889,7 @@ function generateOne({ client, prompt, topic, calItemId, link, referenceImage })
       title: topic || client.name, status: "generating"
     }).select().single();
     return new Promise(resolve => {
-      runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, topic,
+      runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, topic, preferMetaTitle: !!link,
         onComplete: (ok) => { if (calItemId) activeItems.delete(calItemId); resolve(ok); } });
     });
   })().catch(e => { if (calItemId) activeItems.delete(calItemId); throw e; });
