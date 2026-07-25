@@ -1160,9 +1160,17 @@ async function resolveDayEntryArticle(client, entry) {
   const topic = entry.topic || "";
   if (!topic.trim()) return null;
   console.log(`[topic-day] free-text topic search: "${topic}"`);
-  const article = await rssLib.fetchTopicArticle(topic);
-  if (!article) console.log(`[topic-day] Google News search returned nothing for "${topic}"`);
-  return article ? { ...article, _label: topic } : null;
+  // Fetch several results and pick the first this client hasn't used —
+  // otherwise, on days when the #1 Google News result is unchanged from
+  // yesterday, dedup would block and NO new video would be made that day.
+  const items = await rssLib.fetchTopicArticles(topic, 10);
+  if (!items.length) { console.log(`[topic-day] Google News search returned nothing for "${topic}"`); return null; }
+  const { data: used } = await supabase.from("calendar_items")
+    .select("link").eq("client_id", client.id).not("link", "is", null);
+  const usedSet = new Set((used || []).map(u => u.link));
+  const pick = items.find(i => !usedSet.has(i.link));
+  if (!pick) { console.log(`[topic-day] all ${items.length} results for "${topic}" already used by this client`); return null; }
+  return { ...pick, _label: topic };
 }
 
 // Topic-days represent "exactly ONE plan for this weekday" (unlike regular
@@ -1196,7 +1204,7 @@ async function runTopicDaysScheduler() {
 
   for (const client of clients) {
     if (client.last_topic_run === today) continue; // already ran today
-    const entry = client.topic_days.find(e => e && e.day === todayName && (String(e.topic || "").trim() || (e.type === "category" && e.category)));
+    const entry = client.topic_days.find(e => e && (e.day === todayName || e.day === "All") && (String(e.topic || "").trim() || (e.type === "category" && e.category)));
     if (!entry) continue;
     // On a DASHBOARD_ONLY instance (e.g. Render) this only needs to fetch the
     // article + write the prompt (status -> "prompt_ready"); the actual Flow
@@ -1515,7 +1523,7 @@ async function runRecoverySweep(reason = "scheduled") {
         // items proceed on such days.
         const todayName = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][new Date().getDay()];
         const hasTopicDayToday = Array.isArray(client.topic_days) &&
-          client.topic_days.some(e => e && e.day === todayName && (e.topic || e.category));
+          client.topic_days.some(e => e && (e.day === todayName || e.day === "All") && (e.topic || e.category));
         if (hasTopicDayToday && item.source !== "rss" && ["planned", "prompt_ready"].includes(item.status)) {
           console.log(`  ⏭️ ${client.name}: topic-day owns ${today} — skipping regular calendar item "${item.topic}"`);
           continue;
