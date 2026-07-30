@@ -14,6 +14,8 @@ const { spawn } = require("child_process");
 const supabase = require("./lib/supabase");
 const assetsSync = require("./lib/assets-sync");
 const groqLib = require("./lib/groq");
+const chatgptImages = require("./lib/chatgpt-images");
+const imageStore = require("./lib/image-store");
 const videoLib = require("./lib/video");
 const googleLib = require("./lib/google");
 const rssLib = require("./lib/rss");
@@ -170,6 +172,8 @@ app.post("/api/clients/:id/config", upload.fields([
   if (b.prompt_sample !== undefined) patch.prompt_sample = b.prompt_sample || null;
   if (b.split_parts !== undefined) patch.split_parts = b.split_parts === "true" || b.split_parts === true;
   if (b.video_seconds !== undefined) { const s10 = Math.max(10, Math.min(30, Math.round(Number(b.video_seconds)/10)*10)); patch.video_seconds = [10,20,30].includes(s10) ? s10 : 10; }
+  // How many videos to generate per day for this client (1, 2, or 3; default 1).
+  if (b.videos_per_day !== undefined) { const v = Math.round(Number(b.videos_per_day)); patch.videos_per_day = [1,2,3].includes(v) ? v : 1; }
   if (b.per_part_images !== undefined) patch.per_part_images = b.per_part_images === "true" || b.per_part_images === true;
   if (b.upload_to_drive !== undefined) patch.upload_to_drive = b.upload_to_drive === "true";
   if (b.drive_folder_id !== undefined) patch.drive_folder_id = b.drive_folder_id || null;
@@ -191,6 +195,8 @@ app.post("/api/clients/:id/config", upload.fields([
   if (b.fixed_image_prompt !== undefined) patch.fixed_image_prompt = b.fixed_image_prompt || null;
   // Skip ChatGPT image generation entirely — only paste the reference image(s).
   if (b.reference_image_only !== undefined) patch.reference_image_only = b.reference_image_only === "true" || b.reference_image_only === true;
+  // Base Gmail whose plus-aliases are used for ChatGPT image-account signups.
+  if (b.signup_gmail !== undefined) patch.signup_gmail = b.signup_gmail || null;
   // Voiceover on/off + language
   if (b.voiceover_enabled !== undefined) patch.voiceover_enabled = b.voiceover_enabled === "true" || b.voiceover_enabled === true;
   if (b.voiceover_language !== undefined) patch.voiceover_language = b.voiceover_language || "Hindi/Hinglish";
@@ -441,10 +447,12 @@ app.post("/api/clients/:id/generate", upload.fields([{ name: "image", maxCount: 
     const fixedActive = (client.fixed_prompt_mode || client.mode === "products")
       && client.fixed_prompt && String(client.fixed_prompt).trim();
 
+    let itemIsArticle = false;
     if (!prompt && calItemId) {
       const { data: item } = await supabase.from("calendar_items").select("*").eq("id", calItemId).single();
       prompt = item?.prompt;
       topic = item?.topic || topic;
+      itemIsArticle = item?.source === "rss";
       if (!prompt && !fixedActive) {
         prompt = await promptForItem(client, item);
         await supabase.from("calendar_items").update({ prompt, status: "prompt_ready" }).eq("id", calItemId);
@@ -517,10 +525,11 @@ app.post("/api/clients/:id/generate", upload.fields([{ name: "image", maxCount: 
 
     if (calItemId) await supabase.from("calendar_items").update({ status: "generating", updated_at: new Date().toISOString() }).eq("id", calItemId);
 
-    runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, topic, preferMetaTitle: !!link });
+    runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, topic, preferMetaTitle: itemIsArticle });
   } catch (e) {
     generationBusy = false;   // release lock if we failed before the pipeline took over
-    res.status(500).json({ error: e.message });
+    console.error("generate endpoint error:", e.message);
+    if (!res.headersSent) res.status(500).json({ error: e.message });
   }
 });
 
@@ -599,7 +608,11 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
     const profileDir = fs.existsSync(candidateProfile) ? candidateProfile : null;
     if (profileDir) sendLog(jobId, "info", "🔐 Using persistent login profile");
     prompt = groqLib.sanitizePrompt(prompt);   // safety net for manual prompts too
-    const parts = groqLib.splitPromptParts(prompt);
+    let parts = groqLib.splitPromptParts(prompt);
+    // Clamp to the client's configured part count (stored/ChatGPT prompts may
+    // contain extra PART blocks; never generate more than configured).
+    const _maxParts = partsForClient(client);
+    if (parts.length > _maxParts) parts = parts.slice(0, _maxParts);
     const videoTitle = stripPartPrefix((topic && topic.trim()) || deriveTitle(prompt)) || deriveTitle(prompt);
 
     sendLog(jobId, "info", `🚀 Generating for ${client.name}`);
@@ -626,11 +639,74 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
       const partImgPath   = (i, t) => path.join(__dirname, "uploads", `partimg_${stableKey}_${i}_${partHash(t)}.png`);
       const bigEnough = (p) => { try { return fs.statSync(p).size > 10000; } catch { return false; } };
 
+      // ── BATCH ChatGPT-account image generation (mail.tm) ───────────────
+      // Generate ALL part images + a thumbnail in ONE fresh ChatGPT account,
+      // save them (local + Supabase) keyed by calendar item, so a video RETRY
+      // reuses the saved images instead of burning another account cycle.
+      // Falls back gracefully: if it fails, imageForPart uses PromptForge or
+      // the client reference image, exactly as before.
+      const useMailtmImages = process.env.USE_MAILTM_IMAGES === "1";
+      const imgNames = [];
+      for (let i = 1; i <= parts.length; i++) imgNames.push(`part${i}.png`);
+      imgNames.push("thumb.png");
+
+      let batchImages = null;   // { "part1.png": localPath, ..., "thumb.png": localPath }
+      async function ensureBatchImages() {
+        if (batchImages || !useMailtmImages) return;
+        // Retry short-circuit: already have a saved set? reuse, no ChatGPT.
+        if (await imageStore.hasImages(stableKey, imgNames)) {
+          sendLog(jobId, "success", "♻️ Reusing saved image set (no new ChatGPT account)");
+          batchImages = {};
+          for (const n of imgNames) batchImages[n] = await imageStore.getImage(stableKey, n);
+          return;
+        }
+        sendLog(jobId, "progress", "🖼️ Generating all images in a fresh ChatGPT account…");
+        // Build a proper IMAGE-GENERATION instruction for each part. The raw
+        // part text is a video scene block (headings, timings, voiceover) — if
+        // sent as-is, ChatGPT writes a script instead of drawing. Wrap it so
+        // ChatGPT actually generates an image of the scene.
+        const toImagePrompt = (partText) => {
+          if (client.fixed_image_prompt && client.fixed_image_prompt.trim()) return client.fixed_image_prompt.trim();
+          // Send the FULL part text (all scenes, on-screen text, effects,
+          // transition, voiceover) exactly as-is, with an image-generation
+          // instruction on top — the whole part is the description.
+          const part = String(partText || "").trim();
+          return `Create a single image based on the following description. Reply with only the image, no extra text.\n\n${part}`;
+        };
+        const partPrompts = parts.map(toImagePrompt);
+        const out = await chatgptImages.generateAllImages({
+          parts: parts.length,
+          partPrompts,
+          // thumbnailPrompt DISABLED per request — no thumbnail generation for now
+          // thumbnailPrompt: `Generate a single vibrant, eye-catching YouTube thumbnail IMAGE in 9:16 representing: ${videoTitle}. Bold, high-contrast, cinematic, brand-safe. Output only the image.`,
+          referenceImagePath: imagePath || null,   // paste client's reference image into ChatGPT image gen if they have one
+          orderId: process.env.HOSTINGER_ORDER_ID,
+          log: (lvl, m) => sendLog(jobId, lvl, m)
+        });
+        batchImages = {};
+        for (const [name, dataUrl] of Object.entries(out.images || {})) {
+          try { batchImages[name] = await imageStore.saveImage(stableKey, name, dataUrl); }
+          catch (e) { sendLog(jobId, "warn", `save ${name} failed: ${e.message}`); }
+        }
+        if (out.error) sendLog(jobId, "warn", `image batch note: ${out.error}`);
+      }
+
       // Make (or reuse) the ChatGPT image for ONE part — never re-buys an image
       // that was already produced for this exact part text.
       async function imageForPart(i, text) {
         const fp = partImgPath(i, text);
         if (bigEnough(fp)) { sendLog(jobId, "info", `♻️ Reusing saved image for part ${i + 1}`); return fp; }
+
+        // NEW: batch mail.tm path — take this part's image from the saved set.
+        if (useMailtmImages) {
+          await ensureBatchImages();
+          const got = batchImages && batchImages[`part${i + 1}.png`];
+          if (got && bigEnough(got)) {
+            try { fs.copyFileSync(got, fp); return fp; } catch { return got; }
+          }
+          // fall through to fallbacks if the batch didn't produce this part
+        }
+
         // Client configured to skip AI image generation entirely — only the
         // reference image (client's or this item's) gets pasted into Flow,
         // no ChatGPT image call at all for any part.
@@ -662,8 +738,22 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
         }
       }
 
+      // ORDER: generate ALL part images + thumbnail FIRST (in one ChatGPT
+      // session), save them, THEN start video generation. On a retry the saved
+      // set is reused — no new ChatGPT account, no regenerated images.
+      if (useMailtmImages) {
+        await ensureBatchImages().catch(e => sendLog(jobId, "warn", `image batch: ${e.message}`));
+      }
+
       for (let attempt = 1; attempt <= MAX_ATTEMPTS && !success; attempt++) {
-        const parts = groqLib.splitPromptParts(currentPrompt);
+        let parts = groqLib.splitPromptParts(currentPrompt);
+        // Never generate more parts than the client is configured for, even if
+        // the stored/ChatGPT prompt happens to contain extra PART blocks.
+        const maxParts = partsForClient(client);
+        if (parts.length > maxParts) {
+          sendLog(jobId, "info", `✂️ Prompt had ${parts.length} parts; client is configured for ${maxParts} — using first ${maxParts}.`);
+          parts = parts.slice(0, maxParts);
+        }
         if (parts.length > 1) sendLog(jobId, "info", `🧩 Split into ${parts.length} parts`);
         rawFiles = [];
         let failed = false, policy = false;
@@ -761,6 +851,44 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
 
       const finalFull = path.join(outDir, finalName);
 
+      // ── Thumbnail file: same base name as the video, ending in "T" (video
+      //    ends in "V"). Pull from the batch-generated thumb.png if we have it.
+      const baseNoExt = path.parse(finalName).name;
+      const cleanBase = baseNoExt.replace(/[Vv]$/, "");
+      const videoNamed = `${cleanBase}V.mp4`;
+      const thumbNamed = `${cleanBase}T.png`;
+      let thumbFull = null;
+      try {
+        const vTarget = path.join(outDir, videoNamed);
+        if (finalName !== videoNamed) { fs.copyFileSync(finalFull, vTarget); }
+
+        // Thumbnail for EVERY client. It's generated in the SAME ChatGPT image
+        // session as the part images (batch flow), then saved. If for some
+        // reason the batch didn't produce one, fall back to a video frame so
+        // there's always a thumbnail — never PromptForge for the thumbnail.
+        let thumbSrc = await imageStore.getImage(stableKey, "thumb.png").catch(() => null);
+
+        // Video-frame thumbnail fallback DISABLED per request.
+        // if (!thumbSrc) {
+        //   try {
+        //     const frame = path.join(outDir, `${cleanBase}_frame.png`);
+        //     await videoLib.extractFrame(vTarget, frame).catch(() => null);
+        //     if (fs.existsSync(frame)) thumbSrc = frame;
+        //   } catch {}
+        // }
+
+        if (thumbSrc && fs.existsSync(thumbSrc)) {
+          thumbFull = path.join(outDir, thumbNamed);
+          fs.copyFileSync(thumbSrc, thumbFull);
+          await supabase.from("videos").update({ final_file: videoNamed, thumbnail_file: thumbNamed }).eq("id", videoRow.id);
+          sendLog(jobId, "success", `🖼️ Thumbnail ready: ${thumbNamed}`);
+        } else {
+          await supabase.from("videos").update({ final_file: videoNamed }).eq("id", videoRow.id);
+          sendLog(jobId, "info", "no thumbnail source available — uploading without custom thumbnail");
+        }
+      } catch (e) { sendLog(jobId, "warn", `thumbnail/naming step: ${e.message}`); }
+      const uploadVideoFull = fs.existsSync(path.join(outDir, videoNamed)) ? path.join(outDir, videoNamed) : finalFull;
+
       // 4) Drive upload — filename = prompt TITLE (not client name)
       if (client.upload_to_drive) {
         // GLOBAL Drive: one connection for the whole dashboard, stored in settings.
@@ -771,13 +899,25 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
           try {
             sendLog(jobId, "progress", "☁️  Uploading to Google Drive…");
             const link = await googleLib.uploadToDrive({
-              tokens: driveTokens, filePath: finalFull,
-              name: `${videoTitle}.mp4`,
+              tokens: driveTokens, filePath: uploadVideoFull,
+              name: `${videoTitle}V.mp4`,
               folderId: client.drive_folder_id,   // per-client target folder in the shared Drive
               onTokens: (fresh) => { setSetting("drive_tokens", fresh).catch(() => {}); }
             });
             await supabase.from("videos").update({ drive_url: link }).eq("id", videoRow.id);
             sendLog(jobId, "success", `✅ Drive: ${link}`);
+            // Also upload the thumbnail alongside it (same name, ending T).
+            if (thumbFull && fs.existsSync(thumbFull)) {
+              try {
+                await googleLib.uploadToDrive({
+                  tokens: driveTokens, filePath: thumbFull,
+                  name: `${videoTitle}T.png`,
+                  folderId: client.drive_folder_id,
+                  onTokens: (fresh) => { setSetting("drive_tokens", fresh).catch(() => {}); }
+                });
+                sendLog(jobId, "success", "✅ Drive: thumbnail uploaded");
+              } catch (e) { sendLog(jobId, "warn", `Drive thumbnail upload failed: ${e.message}`); }
+            }
           } catch (e) {
             if (e.code === "REAUTH") {
               await setSetting("drive_tokens", null);   // dead token → force global reconnect
@@ -821,8 +961,9 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
 
           sendLog(jobId, "progress", "📺 Uploading to YouTube…");
           const yt = await googleLib.uploadToYouTube({
-            tokens: client.youtube_tokens, filePath: finalFull,
+            tokens: client.youtube_tokens, filePath: uploadVideoFull,
             title, description, tags,
+            thumbnailPath: (thumbFull && fs.existsSync(thumbFull)) ? thumbFull : null,
             onLog: (m) => sendLog(jobId, "info", m)
           });
           await supabase.from("videos").update({
@@ -861,6 +1002,14 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
 
 // Reusable: run one full generation and resolve when the pipeline finishes.
 function generateOne({ client, prompt, topic, calItemId, link, referenceImage }) {
+  // Claim the lock SYNCHRONOUSLY, before any await, so two near-simultaneous
+  // triggers (sweep + manual, or two sweep items) can't both slip past
+  // waitUntilFree() into concurrent browser sessions. If already busy, refuse.
+  if (generationBusy) {
+    return Promise.resolve(false);
+  }
+  generationBusy = true;
+
   let cookiesPath = null;
   if (client.cookies) {
     cookiesPath = path.join(__dirname, "uploads", `cookies_${uuidv4()}.json`);
@@ -1516,6 +1665,18 @@ async function runRecoverySweep(reason = "scheduled") {
         if (!client || client.active === false) continue;
         if (!clientHasSession(client)) { console.log(`  ⏭️ ${client.name}: no login profile`); continue; }
 
+        // VIDEOS-PER-DAY LIMIT: count how many videos this client has already
+        // produced (or is producing) today; skip if it's reached its cap.
+        const perDay = [1, 2, 3].includes(Number(client.videos_per_day)) ? Number(client.videos_per_day) : 1;
+        const { data: doneToday } = await supabase.from("calendar_items")
+          .select("id,status").eq("client_id", client.id).eq("scheduled_date", today)
+          .in("status", ["done", "generating", "uploaded", "composited"]);
+        const producedCount = (doneToday || []).length;
+        if (producedCount >= perDay) {
+          console.log(`  ⏭️ ${client.name}: daily limit reached (${producedCount}/${perDay}) — skipping "${item.topic}"`);
+          continue;
+        }
+
         // TOPIC-DAY PRIORITY: if today is one of this client's configured
         // topic-days, the article pipeline OWNS today — don't generate the
         // regular calendar's planned item for this date (the topic-day
@@ -1773,7 +1934,7 @@ app.get("/api/oauth/:service/start", (req, res) => {
   const clientId = req.query.client_id;
   const service = req.params.service;
   if (!clientId) return res.status(400).send("client_id required");
-  if (service !== "youtube" && service !== "drive") return res.status(400).send("bad service");
+  if (service !== "youtube" && service !== "drive" && service !== "gmail") return res.status(400).send("bad service");
   res.redirect(googleLib.getServiceAuthUrl(`${clientId}::${service}`, service));
 });
 
@@ -1795,9 +1956,10 @@ app.get("/api/oauth/google/callback", async (req, res) => {
 
     // Per-client: carry old refresh_token forward on re-consent.
     const { data: existing } = await supabase.from("clients")
-      .select("youtube_tokens, drive_tokens").eq("id", clientId).maybeSingle();
+      .select("youtube_tokens, drive_tokens, gmail_tokens").eq("id", clientId).maybeSingle();
     const prevTokens = service === "youtube" ? existing?.youtube_tokens
                      : service === "drive" ? existing?.drive_tokens
+                     : service === "gmail" ? existing?.gmail_tokens
                      : (existing?.youtube_tokens || existing?.drive_tokens);
     const { tokens, channelName } = await googleLib.exchangeCode(code, prevTokens);
 
@@ -1808,6 +1970,9 @@ app.get("/api/oauth/google/callback", async (req, res) => {
     } else if (service === "youtube") {
       patch = { youtube_tokens: tokens, youtube_channel: channelName || null };
       label = channelName ? `YouTube (${channelName})` : "YouTube";
+    } else if (service === "gmail") {
+      patch = { gmail_tokens: tokens };
+      label = "Gmail (for ChatGPT signup OTP)";
     } else {
       patch = { youtube_tokens: tokens, drive_tokens: tokens, youtube_channel: channelName || null };
       label = channelName ? `Google (${channelName})` : "Google";
