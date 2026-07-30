@@ -356,6 +356,13 @@ function renderConfig(){
           <option value="30" ${(c.video_seconds||(c.split_parts===false?10:20))==30?'selected':''}>30 seconds — 3 parts, joined</option>
         </select>
         <div class="hint">The script is written as PART 1…N (each 10s), every part is generated separately with its own ChatGPT image, then all parts are concatenated and frame + outro applied.</div></div>
+      <div class="field"><label>Videos per day</label>
+        <select id="cfgVideosPerDay">
+          <option value="1" ${(Number(c.videos_per_day)||1)==1?'selected':''}>1 video per day</option>
+          <option value="2" ${Number(c.videos_per_day)==2?'selected':''}>2 videos per day</option>
+          <option value="3" ${Number(c.videos_per_day)==3?'selected':''}>3 videos per day</option>
+        </select>
+        <div class="hint">How many videos this client generates each day. Once the limit is reached, remaining items for the day wait until tomorrow. Default is 1.</div></div>
     </div>
 
     <div class="card">
@@ -527,6 +534,7 @@ async function saveConfig(){
     if($("cfgPromptCustom")) fd.append("prompt_custom", $("cfgPromptCustom").value);
     if($("cfgPromptSample")) fd.append("prompt_sample", $("cfgPromptSample").value);
     if($("cfgVideoSeconds")) { fd.append("video_seconds", $("cfgVideoSeconds").value); fd.append("split_parts", $("cfgVideoSeconds").value!=="10"); }
+    if($("cfgVideosPerDay")) fd.append("videos_per_day", $("cfgVideosPerDay").value);
     // fixed prompt / voiceover
     if($("cfgFixedPromptMode")) fd.append("fixed_prompt_mode", $("cfgFixedPromptMode").checked);
     if($("cfgFixedPrompt")) fd.append("fixed_prompt", $("cfgFixedPrompt").value);
