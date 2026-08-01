@@ -302,11 +302,15 @@ function renderConfig(){
         <div class="hint">Used verbatim, no ChatGPT call, when the toggle above is on. Also used automatically in "Products only" mode.</div></div>
       <div class="field"><label>Fixed image-generation prompt (optional)</label>
         <textarea id="cfgFixedImagePrompt" placeholder="If set, this exact text is used to generate the reference image for every part, instead of text derived from each scene.">${esc(c.fixed_image_prompt||"")}</textarea></div>
-      <div class="field"><label>Thumbnail prompt (optional)</label>
-        <textarea id="cfgThumbnailPrompt" placeholder="Instruction for the video thumbnail image. The full video script is sent along with this prompt. Leave blank to skip thumbnail generation.">${esc(c.thumbnail_prompt||"")}</textarea>
-        <div class="hint">Sent to ChatGPT together with the full script to generate the thumbnail. If thumbnail generation errors, it retries with a new email/account.</div></div>
       <label class="toggle"><input type="checkbox" id="cfgReferenceImageOnly" ${c.reference_image_only?'checked':''}> Don't generate images with ChatGPT — only use the reference image(s) I've provided</label>
       <div class="hint" style="margin:2px 0 0 24px">Skips the per-part ChatGPT image call entirely for every video. Only the client's uploaded reference image (Config → reference image, or the product-mode image for that day) gets pasted into Flow.</div>
+    </div>
+
+    <div class="card">
+      <div class="section-label">Thumbnail</div>
+      <div class="field"><label>Thumbnail prompt (optional)</label>
+        <textarea id="cfgThumbnailPrompt" placeholder="Instruction for the video thumbnail image. The full video script is sent along with this prompt. Leave blank to skip thumbnail generation.">${esc(c.thumbnail_prompt||"")}</textarea>
+        <div class="hint">A thumbnail image is generated from this prompt plus the full video script. If it errors, it retries with a new email/account. Leave blank to skip thumbnails for this client.</div></div>
     </div>
 
     <div class="card">
