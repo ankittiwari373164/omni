@@ -22,6 +22,7 @@ const rssLib = require("./lib/rss");
 const feedsLib = require("./lib/feeds");
 const { buildScript } = require("./lib/flow");
 
+const cleanupLib = require("./lib/cleanup");
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
@@ -195,6 +196,11 @@ app.post("/api/clients/:id/config", upload.fields([
   if (b.fixed_image_prompt !== undefined) patch.fixed_image_prompt = b.fixed_image_prompt || null;
   // Per-client thumbnail prompt. Sent to ChatGPT together with the full script.
   if (b.thumbnail_prompt !== undefined) patch.thumbnail_prompt = b.thumbnail_prompt || null;
+  // Video aspect ratio for Google Flow: "9:16" (default, vertical) or "16:9".
+  if (b.aspect_ratio !== undefined) patch.aspect_ratio = (b.aspect_ratio === "16:9") ? "16:9" : "9:16";
+  // Enable the Soundverse song + Claude-merge pipeline for this client.
+  // OFF (default) = normal video generation, unchanged.
+  if (b.use_soundverse !== undefined) patch.use_soundverse = b.use_soundverse === "true" || b.use_soundverse === true;
   // Skip ChatGPT image generation entirely — only paste the reference image(s).
   if (b.reference_image_only !== undefined) patch.reference_image_only = b.reference_image_only === "true" || b.reference_image_only === true;
   // Base Gmail whose plus-aliases are used for ChatGPT image-account signups.
@@ -557,7 +563,7 @@ function deriveTitle(prompt) {
 }
 
 // Generate ONE clip for a single prompt part. Resolves to the raw filename or null.
-function generatePart({ jobId, partIndex, cookiesPath, profileDir, imagePath, imagePaths, prompt }) {
+function generatePart({ jobId, partIndex, cookiesPath, profileDir, imagePath, imagePaths, prompt, aspectRatio }) {
   return new Promise((resolve) => {
     const partJob = `${jobId}_p${partIndex}`;
     const scriptPath = path.join(__dirname, "uploads", `script_${partJob}.js`);
@@ -565,7 +571,7 @@ function generatePart({ jobId, partIndex, cookiesPath, profileDir, imagePath, im
       cookiesPath, profileDir,
       imagePaths: imagePaths || (imagePath ? [imagePath] : []),
       prompt: String(prompt).replace(/\s*\n+\s*/g, " ").trim(),
-      aspectRatio: "9:16", speed: "1x", duration: "10s", jobId: partJob
+      aspectRatio: (aspectRatio === "16:9") ? "16:9" : "9:16", speed: "1x", duration: "10s", jobId: partJob
     }));
 
     const proc = spawn("node", [scriptPath], {
@@ -807,7 +813,7 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
           // Paste BOTH the per-part image AND the client's reference image.
           const imgs = [...new Set([partImg, imagePath].filter(Boolean))];
           if (imgs.length) sendLog(jobId, "info", `🖼️ Part ${i + 1}: pasting ${imgs.length} image(s) into Flow`);
-          const res = await generatePart({ jobId, partIndex: i, cookiesPath, profileDir, imagePaths: imgs, prompt: parts[i] });
+          const res = await generatePart({ jobId, partIndex: i, cookiesPath, profileDir, imagePaths: imgs, prompt: parts[i], aspectRatio: client.aspect_ratio || "9:16" });
           if (!res.file) { failed = true; policy = res.policy; break; }
           // Persist under the stable name so a later crawl can reuse it.
           try { fs.renameSync(path.join(outDir, res.file), keep); rawFiles.push(path.basename(keep)); }
@@ -930,8 +936,10 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
         if (thumbSrc && fs.existsSync(thumbSrc)) {
           thumbFull = path.join(outDir, thumbNamed);
           fs.copyFileSync(thumbSrc, thumbFull);
-          await supabase.from("videos").update({ final_file: videoNamed, thumbnail_file: thumbNamed }).eq("id", videoRow.id);
-          sendLog(jobId, "success", `🖼️ Thumbnail ready: ${thumbNamed}`);
+          // ENFORCE .png extension for thumbnail (never .mp4)
+          const safeThumbnailName = thumbNamed.endsWith('.png') ? thumbNamed : thumbNamed.replace(/\.[^.]+$/, '.png');
+          await supabase.from("videos").update({ final_file: videoNamed, thumbnail_file: safeThumbnailName }).eq("id", videoRow.id);
+          sendLog(jobId, "success", `🖼️ Thumbnail ready: ${safeThumbnailName}`);
         } else {
           await supabase.from("videos").update({ final_file: videoNamed }).eq("id", videoRow.id);
           sendLog(jobId, "info", "no thumbnail source available — uploading without custom thumbnail");
@@ -979,7 +987,27 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
         }
       }
 
-      // 5) YouTube upload — title = prompt TITLE
+      // WAIT FOR TIME SLOT: if this calendar item has a scheduled time (morning/afternoon/evening),
+      // wait until that time before uploading. This allows multiple videos to upload at staggered times.
+      if (videoRow.time_slot) {
+        const slot = String(videoRow.time_slot).toLowerCase();
+        const times = { morning: 8, afternoon: 14, evening: 18 };  // hours in 24-hour format
+        const uploadHour = times[slot] || 8;
+        const now = new Date();
+        let uploadTime = new Date(now);
+        uploadTime.setHours(uploadHour, 0, 0, 0);
+        // If that time already passed today, schedule for tomorrow
+        if (uploadTime <= now) uploadTime.setDate(uploadTime.getDate() + 1);
+        if (uploadTime > now) {
+          const waitMs = uploadTime - now;
+          const waitMins = Math.round(waitMs / 60000);
+          sendLog(jobId, "info", `⏰ Scheduled upload for ${slot} (${uploadTime.toLocaleString()}). Waiting ${waitMins} minutes…`);
+          await new Promise(resolve => setTimeout(resolve, waitMs));
+          sendLog(jobId, "info", `⏰ time reached, uploading now`);
+        }
+      }
+
+            // 5) YouTube upload — title = prompt TITLE
       if (client.upload_to_youtube && client.youtube_tokens) {
         try {
           sendLog(jobId, "progress", "📺 Preparing YouTube metadata…");
@@ -1493,14 +1521,14 @@ async function runCalendarAutoRefill() {
       console.log(`📅 auto-refill: ${client.name} has ${remaining} future item(s) — generating ${CALENDAR_REFILL_DAYS} more from ${startDate}`);
       const items = await groqLib.generateCalendar({
         businessName: client.name, businessDetails: client.business_details,
-        chatLink: client.chatgpt_link, days: CALENDAR_REFILL_DAYS, startDate
+        chatLink: client.chatgpt_link, days: CALENDAR_REFILL_DAYS, startDate, videosPerDay: client.videos_per_day || 1
       });
       const rows = items.map(it => ({ ...it, client_id: client.id, status: "planned" }));
-      // Don't duplicate a date the client already has an item on.
-      const { data: existingDates } = await supabase.from("calendar_items")
-        .select("scheduled_date").eq("client_id", client.id).gte("scheduled_date", startDate);
-      const taken = new Set((existingDates || []).map(e => e.scheduled_date));
-      const toInsert = rows.filter(r => !taken.has(r.scheduled_date));
+      // Allow multiple items per day (different time_slots), but don't duplicate an exact date+time_slot combo.
+      const { data: existing } = await supabase.from("calendar_items")
+        .select("scheduled_date,time_slot").eq("client_id", client.id).gte("scheduled_date", startDate);
+      const taken = new Set((existing || []).map(e => `${e.scheduled_date}|${e.time_slot || "morning"}`));
+      const toInsert = rows.filter(r => !taken.has(`${r.scheduled_date}|${r.time_slot || "morning"}`));
       if (toInsert.length) {
         const { error } = await supabase.from("calendar_items").insert(toInsert);
         if (error) console.log(`auto-refill insert failed for ${client.name}: ${error.message}`);
@@ -1854,6 +1882,31 @@ async function retryFailedForToday() { return runRecoverySweep("afternoon"); }
 
 // Recovery crawl: every SWEEP_MINUTES (default 4 hours), plus ~60s after
 // startup so a power-cut/reboot resumes today's unfinished work immediately.
+// AUTO-CLEANUP: run daily at 3 AM (deletes videos older than CLEANUP_KEEP_DAYS)
+const CLEANUP_HOUR = 3;
+function scheduleCleanup() {
+  const now = new Date();
+  let nextCleanup = new Date(now);
+  nextCleanup.setHours(CLEANUP_HOUR, 0, 0, 0);
+  if (nextCleanup <= now) nextCleanup.setDate(nextCleanup.getDate() + 1);
+  const delayMs = nextCleanup - now;
+  console.log(`🧹 next cleanup scheduled for ${nextCleanup.toLocaleString()} (in ${Math.round(delayMs / 3600000)} hours)`);
+  setTimeout(() => {
+    runCleanup("scheduled").catch(e => console.log("cleanup:", e.message));
+    scheduleCleanup(); // reschedule for next day
+  }, delayMs);
+}
+scheduleCleanup();
+
+async function runCleanup(reason) {
+  if (process.env.DASHBOARD_ONLY) { console.log("cleanup: skipped on DASHBOARD_ONLY instance"); return; }
+  console.log(`🧹 cleanup (${reason}): starting…`);
+  const r = await cleanupLib.cleanupOldVideos({
+    supabase, log: (lvl, m) => console.log(`cleanup: [${lvl}] ${m}`)
+  });
+  console.log(`🧹 cleanup: ${r.deleted} deleted, ${Math.round(r.freed_mb)} MB freed, ${r.errors} errors`);
+}
+
 setInterval(() => runRecoverySweep("scheduled").catch(e => console.log("sweep:", e.message)), SWEEP_MINUTES * 60 * 1000);
 setTimeout(() => runRecoverySweep("startup").catch(e => console.log("sweep:", e.message)), 60 * 1000);
 
@@ -1974,6 +2027,15 @@ app.post("/api/sweep/run-now", async (req, res) => {
   res.json({ ok: true, message: "Sweep started — watch the local terminal." });
   runRecoverySweep("manual").catch(e => console.log("sweep:", e.message));
 });
+
+app.post("/api/cleanup/run-now", async (req, res) => {
+  if (process.env.DASHBOARD_ONLY) {
+    return res.status(400).json({ error: "cleanup only runs on the local worker" });
+  }
+  runCleanup("manual").catch(e => console.log("cleanup:", e.message));
+  res.json({ ok: true, message: "cleanup started — watch the worker logs" });
+});
+
 
 // Time-gated trigger: check every 15 min; fire once per day at/after RETRY_HOUR.
 setInterval(() => {
