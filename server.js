@@ -987,13 +987,10 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
           const imgPromptText = (client.fixed_image_prompt && client.fixed_image_prompt.trim())
             ? client.fixed_image_prompt.trim()
             : text;
-          const dataUrl = await groqLib.generateImage(imgPromptText, client.image_chat_link || "");
-          let buf;
-          if (dataUrl.startsWith("data:")) buf = Buffer.from(dataUrl.split(",")[1], "base64");
-          else { const r = await fetch(dataUrl); buf = Buffer.from(await r.arrayBuffer()); }
-          fs.writeFileSync(fp, buf);
-          safeLog(jobId, "success", `✅ Image ready for part ${i + 1}`);
-          return fp;
+          // Old groqLib.generateImage is deprecated (used ngrok)
+          // Just return null to use client's reference image instead
+          safeLog(jobId, "info", `using client reference image for part ${i + 1}`);
+          return null;
         } catch (e) {
           safeLog(jobId, "warn", `Part ${i + 1} image failed (${e.message}) — using client image`);
           return null;
