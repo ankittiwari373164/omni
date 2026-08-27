@@ -23,6 +23,7 @@ const feedsLib = require("./lib/feeds");
 const { buildScript } = require("./lib/flow");
 
 const cleanupLib = require("./lib/cleanup");
+const { chromium } = require("playwright");
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
@@ -685,18 +686,39 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
           return `Create a single image based on the following description. Reply with only the image, no extra text.\n\n${part}`;
         };
         const partPrompts = parts.map(toImagePrompt);
-        const out = await chatgptImages.generateAllImages({
-          parts: parts.length,
-          partPrompts,
-          // Thumbnail: only when the client has a thumbnail_prompt configured.
-          // Sends the client's thumbnail prompt + the FULL video script.
-          thumbnailPrompt: (client.thumbnail_prompt && client.thumbnail_prompt.trim())
-            ? `${client.thumbnail_prompt.trim()}\n\n--- FULL VIDEO SCRIPT ---\n${currentPrompt}`
-            : null,
-          referenceImagePath: imagePath || null,   // paste client's reference image into ChatGPT image gen if they have one
-          orderId: process.env.HOSTINGER_ORDER_ID,
-          log: (lvl, m) => sendLog(jobId, lvl, m)
-        });
+        
+        // TRY persistent ChatGPT profile first (stays logged in forever)
+        let out = null;
+        const profileDir = path.join(__dirname, "sessions", "chatgpt");
+        if (fs.existsSync(profileDir)) {
+          sendLog(jobId, "info", "🔐 using persistent ChatGPT profile for images…");
+          try {
+            const profileImages = await generateImagesViaProfile(profileDir, parts, currentPrompt, jobId);
+            if (profileImages && Object.keys(profileImages).length > 0) {
+              out = { images: profileImages };
+            } else {
+              sendLog(jobId, "warn", "profile images failed, falling back to regular method");
+            }
+          } catch (e) {
+            sendLog(jobId, "warn", `profile images error: ${e.message}, using regular method`);
+          }
+        }
+        
+        // FALLBACK to regular image generation (if session didn't work)
+        if (!out || !out.images) {
+          out = await chatgptImages.generateAllImages({
+            parts: parts.length,
+            partPrompts,
+            // Thumbnail: only when the client has a thumbnail_prompt configured.
+            // Sends the client's thumbnail prompt + the FULL video script.
+            thumbnailPrompt: (client.thumbnail_prompt && client.thumbnail_prompt.trim())
+              ? `${client.thumbnail_prompt.trim()}\n\n--- FULL VIDEO SCRIPT ---\n${currentPrompt}`
+              : null,
+            referenceImagePath: imagePath || null,   // paste client's reference image into ChatGPT image gen if they have one
+            orderId: process.env.HOSTINGER_ORDER_ID,
+            log: (lvl, m) => sendLog(jobId, lvl, m)
+          });
+        }
         batchImages = {};
         for (const [name, dataUrl] of Object.entries(out.images || {})) {
           try { batchImages[name] = await imageStore.saveImage(stableKey, name, dataUrl); }
@@ -1661,6 +1683,18 @@ async function promptForItem(client, item) {
       skipThemeDistillation: item.meta?.skipThemeDistillation === true
     });
   }
+  // TRY persistent ChatGPT profile first (stays logged in forever)
+  try {
+    const profileDir = path.join(__dirname, "sessions", "chatgpt");
+    if (fs.existsSync(profileDir)) {
+      const prompt = await generatePromptViaProfile(client, item, profileDir, jobId);
+      if (prompt) return prompt;
+    }
+  } catch (e) {
+    sendLog(jobId, "warn", `persistent profile failed: ${e.message}, using Groq`);
+  }
+  
+  // FALLBACK: Groq (when persistent profile not available or failed)
   return groqLib.generatePrompt({
     businessName: client.name, businessDetails: client.business_details, chatLink: client.chatgpt_link,
     topic: item.topic, hook: item.hook,
