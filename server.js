@@ -1101,6 +1101,109 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
 // ====================================================================
 
 // Reusable: run one full generation and resolve when the pipeline finishes.
+
+// Generate images using persistent ChatGPT profile
+async function generateImagesViaProfile(profileDir, parts, fullPrompt, jobId) {
+  try {
+    let browser;
+    try {
+      browser = await chromium.launchPersistentContext(profileDir, {
+        headless: true,
+        channel: "chrome"
+      });
+    } catch (e) {
+      browser = await chromium.launchPersistentContext(profileDir, {
+        headless: true
+      });
+    }
+
+    const page = browser.pages()[0] || await browser.newPage();
+    const images = {};
+
+    sendLog(jobId, "info", `🔐 using persistent ChatGPT profile to generate ${parts.length} images`);
+    
+    await page.goto("https://chatgpt.com", { 
+      waitUntil: "domcontentloaded", 
+      timeout: 30000 
+    }).catch(() => {});
+    await page.waitForTimeout(2000);
+
+    // Generate one image per part
+    for (let i = 0; i < parts.length; i++) {
+      const partText = String(parts[i] || "").trim();
+      if (!partText) continue;
+
+      const imageName = `part${i + 1}.png`;
+      const instruction = `Create a single image based on this scene description. Reply with ONLY the image, no text.
+
+${partText}`;
+
+      try {
+        const input = await page.locator("textarea, [contenteditable='true']").first().waitFor({ timeout: 10000 }).catch(() => null);
+        if (!input) break;
+
+        await input.click();
+        await input.fill("");
+        
+        for (const ch of instruction) {
+          await page.keyboard.type(ch, { delay: 1 + Math.random() * 2 });
+        }
+        await page.waitForTimeout(300);
+        await page.keyboard.press("Enter");
+        await page.waitForTimeout(3000);
+
+        // Wait for image
+        sendLog(jobId, "info", `⏳ generating image ${i + 1}/${parts.length}…`);
+        const imgDeadline = Date.now() + 120000; // 2 min per image
+        
+        while (Date.now() < imgDeadline) {
+          const imgs = await page.locator("img[src*='oaiusercontent'], img[src*='image']").all().catch(() => []);
+          
+          if (imgs.length > 0) {
+            const lastImg = imgs[imgs.length - 1];
+            const dataUrl = await lastImg.evaluate(img => {
+              const canvas = document.createElement("canvas");
+              canvas.width = img.width;
+              canvas.height = img.height;
+              const ctx = canvas.getContext("2d");
+              ctx.drawImage(img, 0, 0);
+              return canvas.toDataURL("image/png");
+            }).catch(() => null);
+
+            if (dataUrl && dataUrl.startsWith("data:image")) {
+              images[imageName] = dataUrl;
+              sendLog(jobId, "success", `✅ ${imageName}`);
+              break;
+            }
+          }
+          await page.waitForTimeout(2000);
+        }
+      } catch (e) {
+        sendLog(jobId, "warn", `image ${i + 1} failed: ${e.message}`);
+      }
+    }
+
+    // Generate thumbnail from first image or request new one
+    if (!images["thumb.png"] && images["part1.png"]) {
+      images["thumb.png"] = images["part1.png"];
+      sendLog(jobId, "success", `✅ thumb.png (from part1)`);
+    }
+
+    await browser.close();
+
+    if (Object.keys(images).length > 0) {
+      sendLog(jobId, "success", `✅ generated ${Object.keys(images).length} images via profile`);
+      return images;
+    }
+
+    return null;
+  } catch (e) {
+    sendLog(jobId, "error", `ChatGPT image profile error: ${e.message}`);
+    return null;
+  }
+}
+
+
 function generateOne({ client, prompt, topic, calItemId, link, referenceImage }) {
   // Claim the lock SYNCHRONOUSLY, before any await, so two near-simultaneous
   // triggers (sweep + manual, or two sweep items) can't both slip past
