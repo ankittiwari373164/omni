@@ -155,9 +155,9 @@ Hook: ${item.hook || "(none)"}
 
 Generate ONE vivid, actionable, filmable video prompt (just the prompt, no explanation).`;
 
-    const input = await page.locator("textarea, [contenteditable='true']").first().waitFor({ timeout: 15000 }).catch(() => null);
+    const input = await page.locator("#prompt-textarea, textarea[placeholder*='Message'], textarea, [contenteditable='true']").first().waitFor({ timeout: 15000 }).catch(() => null);
     if (!input) {
-      safeLog(jobId, "warn", "could not find ChatGPT input");
+      safeLog(jobId, "warn", "could not find ChatGPT input — page structure may have changed");
       await browser.close();
       return null;
     }
@@ -1056,21 +1056,9 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
             currentPrompt = String(client.fixed_prompt).trim();
             safeLog(jobId, "info", "📌 Retry keeps the client's fixed prompt (config preserved)");
           } else {
-            try {
-              const voiceoverEnabled = client.voiceover_enabled !== false;
-              const voiceoverLanguage = client.voiceover_language || "Hindi/Hinglish";
-              const fresh = await groqLib.generatePrompt({
-                businessName: client.name, businessDetails: client.business_details, chatLink: client.chatgpt_link,
-                topic: videoTitle, styleKey: client.prompt_style, styleInstruction: client.prompt_custom,
-                promptSample: client.prompt_sample, parts: partsForClient(client),
-                voiceoverEnabled, voiceoverLanguage
-              });
-              currentPrompt = groqLib.sanitizePrompt(fresh);
-              safeLog(jobId, "info", `📋 New prompt: ${currentPrompt.slice(0, 90)}…`);
-            } catch (e) {
-              safeLog(jobId, "error", `Could not regenerate prompt: ${e.message}`);
-              break;
-            }
+            // Prompt regeneration requires ChatGPT profile
+            // Just use the existing prompt
+            safeLog(jobId, "info", "using existing prompt (no regeneration available)");
           }
         }
       }
@@ -1889,17 +1877,9 @@ async function promptForItem(client, item, jobId = "unknown") {
       if (prompt) return prompt;
     }
   } catch (e) {
-    safeLog(jobId, "warn", `persistent profile failed: ${e.message}, using Groq`);
+    safeLog(jobId, "warn", `persistent profile failed: ${e.message}`);
+    return null; // No fallback available
   }
-  
-  // FALLBACK: Groq (when persistent profile not available or failed)
-  return groqLib.generatePrompt({
-    businessName: client.name, businessDetails: client.business_details, chatLink: client.chatgpt_link,
-    topic: item.topic, hook: item.hook,
-    styleKey: client.prompt_style, styleInstruction: client.prompt_custom,
-    promptSample: client.prompt_sample, parts: partsForClient(client),
-    voiceoverEnabled, voiceoverLanguage
-  });
 }
 
 // ====================================================================
