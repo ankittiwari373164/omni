@@ -1739,12 +1739,11 @@ async function runCalendarAutoRefill() {
         startDate = d.toISOString().slice(0, 10);
       }
 
-      console.log(`📅 auto-refill: ${client.name} has ${remaining} future item(s) — generating ${CALENDAR_REFILL_DAYS} more from ${startDate}`);
-      const items = await groqLib.generateCalendar({
-        businessName: client.name, businessDetails: client.business_details,
-        chatLink: client.chatgpt_link, days: CALENDAR_REFILL_DAYS, startDate, videosPerDay: client.videos_per_day || 1
-      });
-      const rows = items.map(it => ({ ...it, client_id: client.id, status: "planned" }));
+      console.log(`📅 auto-refill: ${client.name} has ${remaining} future item(s) — skipping auto-generation (use manual topics only)`);
+      // Calendar generation requires an LLM (Groq/ChatGPT API)
+      // Since you're using persistent profile only for prompts/images,
+      // please add topics manually to the calendar in the dashboard
+      return;
       // Allow multiple items per day (different time_slots), but don't duplicate an exact date+time_slot combo.
       const { data: existing } = await supabase.from("calendar_items")
         .select("scheduled_date,time_slot").eq("client_id", client.id).gte("scheduled_date", startDate);
