@@ -401,7 +401,7 @@ app.post("/api/calendar/:itemId/prompt", async (req, res) => {
     if (!item) return res.status(404).json({ error: "item not found" });
     const { data: client } = await supabase.from("clients").select("*").eq("id", item.client_id).single();
 
-    const prompt = await promptForItem(client, item);
+    const prompt = await promptForItem(client, item, "calendar-setup");
 
     const { data, error } = await supabase.from("calendar_items")
       .update({ prompt, status: "prompt_ready" }).eq("id", item.id).select().single();
@@ -463,7 +463,7 @@ app.post("/api/clients/:id/generate", upload.fields([{ name: "image", maxCount: 
       topic = item?.topic || topic;
       itemIsArticle = item?.source === "rss";
       if (!prompt && !fixedActive) {
-        prompt = await promptForItem(client, item);
+        prompt = await promptForItem(client, item, jobId);
         await supabase.from("calendar_items").update({ prompt, status: "prompt_ready" }).eq("id", calItemId);
       }
     }
@@ -774,10 +774,6 @@ function runPipeline({ jobId, client, cookiesPath, imagePath, prompt, videoRow, 
         // reference image (client's or this item's) gets pasted into Flow,
         // no ChatGPT image call at all for any part.
         if (client.reference_image_only) {
-          return null;
-        }
-        if (!process.env.CHATGPT_SERVER_URL) {
-          sendLog(jobId, "warn", "CHATGPT_SERVER_URL not set — using client image");
           return null;
         }
         try {
@@ -1756,7 +1752,7 @@ function partsForClient(client) {
   return 2;   // default = 20s (2 parts)
 }
 
-async function promptForItem(client, item) {
+async function promptForItem(client, item, jobId = "unknown") {
   // 1) Client configured to ALWAYS use one fixed prompt — never calls ChatGPT
   //    for the video prompt at all. Also applies automatically in "products"
   //    mode, since that mode is defined as "one fixed prompt for every day"
