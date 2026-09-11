@@ -69,27 +69,15 @@ function sendLog(jobId, type, message) {
     if (job.ws && job.ws.readyState === WebSocket.OPEN) job.ws.send(JSON.stringify(entry));
   }
   console.log(`[${jobId.slice(0, 6)}] ${message}`);
-  // Relay to Supabase so the Render dashboard (a different machine) can show
-  // logs from the local generator. Fire-and-forget; never blocks the pipeline.
-  supabase.from("job_logs").insert({
-    job_id: jobId,
-    client_id: job?.clientId || null,
-    type, message, ts: entry.ts
-  }).then(() => {}, () => {});
+  // NOTE: Database logging disabled - logs only go to console and live WebSocket.
 }
 
 // Recent generation logs (read from Supabase) — lets ANY dashboard (Render or
 // local) show live logs from the local generator. Poll with ?since=<ts>.
 app.get("/api/logs", async (req, res) => {
-  try {
-    const since = Number(req.query.since || 0);
-    const clientId = req.query.client_id;
-    let q = supabase.from("job_logs").select("*").gt("ts", since).order("ts", { ascending: true }).limit(300);
-    if (clientId) q = q.eq("client_id", clientId);
-    const { data, error } = await q;
-    if (error) return res.status(500).json({ error: error.message });
-    res.json(data || []);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  // Database logging disabled - return empty array.
+  // Live logs are available via WebSocket connection instead.
+  res.json([]);
 });
 
 // helper: persist an uploaded file into assets/ with a stable name
