@@ -69,15 +69,27 @@ function sendLog(jobId, type, message) {
     if (job.ws && job.ws.readyState === WebSocket.OPEN) job.ws.send(JSON.stringify(entry));
   }
   console.log(`[${jobId.slice(0, 6)}] ${message}`);
-  // NOTE: Database logging disabled - logs only go to console and live WebSocket.
+  // Relay to Supabase so the Render dashboard (a different machine) can show
+  // logs from the local generator. Fire-and-forget; never blocks the pipeline.
+  supabase.from("job_logs").insert({
+    job_id: jobId,
+    client_id: job?.clientId || null,
+    type, message, ts: entry.ts
+  }).then(() => {}, () => {});
 }
 
 // Recent generation logs (read from Supabase) — lets ANY dashboard (Render or
 // local) show live logs from the local generator. Poll with ?since=<ts>.
 app.get("/api/logs", async (req, res) => {
-  // Database logging disabled - return empty array.
-  // Live logs are available via WebSocket connection instead.
-  res.json([]);
+  try {
+    const since = Number(req.query.since || 0);
+    const clientId = req.query.client_id;
+    let q = supabase.from("job_logs").select("*").gt("ts", since).order("ts", { ascending: true }).limit(300);
+    if (clientId) q = q.eq("client_id", clientId);
+    const { data, error } = await q;
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data || []);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // helper: persist an uploaded file into assets/ with a stable name
@@ -1306,6 +1318,16 @@ app.post("/api/clients/:id/rss/run-now", async (req, res) => {
 
 // Daily scheduler: for each RSS client, pick unique per-category news & auto-generate
 async function runRssScheduler() {
+  // GATE: don't generate prompts/videos for RSS clients while the recovery
+  // sweep is mid-video for a different client — that's what caused prompts for
+  // other clients to appear in between an ongoing generation. Wait for the
+  // sweep to finish (bounded wait so this scheduler can't hang forever).
+  {
+    const start = Date.now();
+    while (sweepRunning && (Date.now() - start < 20 * 60 * 1000)) {
+      await new Promise(r => setTimeout(r, 5000));
+    }
+  }
   const today = localToday();
   let clients;
   try {
@@ -1337,7 +1359,7 @@ async function runRssScheduler() {
 
 // check hourly; also once ~30s after startup
 setInterval(() => runRssScheduler().catch(e => console.log("RSS scheduler:", e.message)), 60 * 60 * 1000);
-setTimeout(() => runRssScheduler().catch(() => {}), 30 * 1000);
+setTimeout(() => runRssScheduler().catch(() => {}), 70 * 1000);  // after sweep (60s) claims sweepRunning
 
 // ====================================================================
 //  TOPIC-DAYS — day-fixed monthly topics (independent of RSS categories
@@ -1409,6 +1431,14 @@ async function overrideTodayForTopicDay(client, today) {
 }
 
 async function runTopicDaysScheduler() {
+  // GATE: same reasoning as runRssScheduler — wait for the sweep to finish so
+  // this doesn't generate prompts/videos for other clients mid-sweep.
+  {
+    const start = Date.now();
+    while (sweepRunning && (Date.now() - start < 20 * 60 * 1000)) {
+      await new Promise(r => setTimeout(r, 5000));
+    }
+  }
   const today = localToday();
   const todayName = WEEKDAY_NAMES[new Date().getDay()];
   let clients;
@@ -1461,7 +1491,7 @@ async function runTopicDaysScheduler() {
 }
 
 setInterval(() => runTopicDaysScheduler().catch(e => console.log("Topic-day scheduler:", e.message)), 60 * 60 * 1000);
-setTimeout(() => runTopicDaysScheduler().catch(() => {}), 45 * 1000);
+setTimeout(() => runTopicDaysScheduler().catch(() => {}), 75 * 1000);  // after sweep (60s) claims sweepRunning
 
 // ── AUTO-REFILL CALENDAR ──────────────────────────────────────────────────
 // When a regular-calendar client runs low on FUTURE planned items, generate a
@@ -1537,7 +1567,10 @@ app.post("/api/calendar/refill-now", async (req, res) => {
 
 // Run daily (every 24h) plus ~90s after startup.
 setInterval(() => runCalendarAutoRefill().catch(e => console.log("auto-refill:", e.message)), 24 * 60 * 60 * 1000);
-setTimeout(() => runCalendarAutoRefill().catch(() => {}), 90 * 1000);
+// REMOVED: separate 90s calendar-refill timer. It fired CONCURRENTLY with the
+// video sweep, causing prompts for other clients to generate while one video
+// was ongoing. Calendar refill now runs INSIDE the sweep (STEP 1), fully
+// awaited BEFORE any video generation (STEP 2). See runRecoverySweep().
 
 // Fast test — just fetch the article, don't generate a video. No login
 // session needed. Good for quickly checking a topic/category actually
@@ -1770,6 +1803,21 @@ async function runRecoverySweep(reason = "scheduled") {
   if (sweepRunning) return;                   // never overlap sweeps
   sweepRunning = true;
   try {
+    // ── STEP 1: FILL ALL CALENDARS FIRST (blocking) ──
+    // Before ANY video generation, populate every client's calendar completely.
+    // This is awaited to completion, so no prompts for other clients get created
+    // while a video is generating. Only startup runs this; scheduled sweeps skip
+    // it (the daily 24h interval handles routine refills).
+    if (reason === "startup") {
+      console.log("📅 STEP 1: filling ALL calendars before any video generation…");
+      try {
+        await runCalendarAutoRefill();
+        console.log("📅 STEP 1 complete: all calendars filled — starting videos");
+      } catch (e) {
+        console.log("📅 calendar fill error (continuing to videos):", e.message);
+      }
+    }
+
     const today = localToday();
     const wanted = ["error", "generating"];
     if (RECOVER_PLANNED) wanted.push("planned", "prompt_ready");
